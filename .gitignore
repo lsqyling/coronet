@@ -1,0 +1,29 @@
+# Build directories
+build-debug/
+build-release/
+build-*/
+cmake-build-*/
+build/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.so
+*.a
+*.dylib
+
+# CMake
+CMakeUserPresets.json
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json

@@ -1,0 +1,10 @@
+^D:\DEV\WORKSPACE\YIDAOYUN\CORONET\BUILD\CMAKEFILES\FA9B40112DF6DCC9C38C989337E50DB7\GENERATE.STAMP.RULE
+setlocal
+D:\dev\tools\cmake\bin\cmake.exe -SD:/dev/workspace/yidaoyun/coronet -BD:/dev/workspace/yidaoyun/coronet/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/dev/workspace/yidaoyun/coronet/build/coronet.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

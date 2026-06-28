@@ -1,0 +1,16 @@
+# coronet coding style (adapted from co_context)
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 80
+PointerAlignment: Right
+AlwaysBreakTemplateDeclarations: Yes
+BreakBeforeBraces: Attach
+NamespaceIndentation: Inner
+QualifierAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+SpaceAfterTemplateKeyword: true
+PackConstructorInitializers: Never
+Standard: c++20

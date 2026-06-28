@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# coronet build & test script
+set -euo pipefail
+
+BUILD_DIR="${BUILD_DIR:-build}"
+BUILD_TYPE="${BUILD_TYPE:-Debug}"
+CORONET_BUILD_TESTS="${CORONET_BUILD_TESTS:-ON}"
+CORONET_BUILD_BENCHMARKS="${CORONET_BUILD_BENCHMARKS:-OFF}"
+CORONET_BUILD_EXAMPLES="${CORONET_BUILD_EXAMPLES:-OFF}"
+CORONET_USE_MIMALLOC="${CORONET_USE_MIMALLOC:-OFF}"
+
+echo "=== coronet build ==="
+echo "  BUILD_DIR=${BUILD_DIR}"
+echo "  BUILD_TYPE=${BUILD_TYPE}"
+echo "  TESTS=${CORONET_BUILD_TESTS}"
+echo "  BENCHMARKS=${CORONET_BUILD_BENCHMARKS}"
+echo ""
+
+cmake -S . -B "${BUILD_DIR}" -G Ninja \
+    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DCORONET_BUILD_TESTS="${CORONET_BUILD_TESTS}" \
+    -DCORONET_BUILD_BENCHMARKS="${CORONET_BUILD_BENCHMARKS}" \
+    -DCORONET_BUILD_EXAMPLES="${CORONET_BUILD_EXAMPLES}" \
+    -DCORONET_USE_MIMALLOC="${CORONET_USE_MIMALLOC}"
+
+cmake --build "${BUILD_DIR}"
+
+echo ""
+echo "=== running tests ==="
+cd "${BUILD_DIR}"
+ctest --output-on-failure

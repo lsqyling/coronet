@@ -1,0 +1,27 @@
+coronet
+Copyright 2026 coronet contributors
+
+This product includes software developed by the co_context project
+(https://github.com/Codesire-Deng/co_context), Copyright Zifeng Deng,
+licensed under the Apache License, Version 2.0.
+
+coronet is a derivative work of co_context, with the following major changes:
+
+- Cross-platform support: added Windows IOCP backend (co_context is Linux-only)
+- Static polymorphism: replaced virtual base proactor class with C++20 concepts
+  and compile-time platform selection
+- Modern C++ refactoring: std::unique_ptr ownership, constexpr where possible,
+  reduced macro usage in favor of metaprogramming
+- Extended API: when_all/when_any/when_some combinators, defer utility,
+  timeout_at, async::read/write (Windows background thread)
+- I/O operation recycling: per-thread free list (ASIO pattern) for IOCP path
+- Build system: CMake cross-platform build with external dependency management
+- Comprehensive test suite: 11 test programs covering all core APIs
+- Performance benchmarks: redis-echo comparison across GCC/Clang/MSVC
+
+Original co_context source files that were substantially modified are located
+under include/coronet/ and lib/coronet/. The architecture design, io_uring
+integration patterns, and basic coroutine infrastructure (task, generator,
+shared_task, SPSC ring) trace their lineage to co_context.
+
+For the original work, see: https://github.com/Codesire-Deng/co_context
