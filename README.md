@@ -308,52 +308,15 @@ task<> consumer() {
 
 ## API 参考
 
-### 核心类型
+完整 API 手册（14 节，含代码示例）→ **[doc/api_Manual.md](doc/api_Manual.md)**
 
-| API | 文件 | 说明 |
-|---|---|---|
-| `task<T>` | `coronet/task.hpp` | 惰性协程，move-only，parent-chain |
-| `shared_task<T>` | `coronet/shared_task.hpp` | 引用计数，多等待者 |
-| `generator<T>` | `coronet/generator.hpp` | P2502R2 标准生成器 |
-
-### I/O 上下文
-
-| API | 说明 |
-|---|---|
-| `io_context` | 事件循环调度器 |
-| `ctx.co_spawn(task<void>)` | 向指定 io_context spawn 任务 |
-| `co_spawn(task<void>)` | 向当前线程的 io_context spawn |
-| `this_io_context()` | 获取当前线程的 io_context |
-
-### 异步 I/O
-
-| API | 说明 |
-|---|---|
-| `async::recv(fd, buf)` | 接收数据 |
-| `async::send(fd, buf)` | 发送数据 |
-| `async::accept(fd, addr, addrlen)` | 接受连接 |
-| `async::connect(fd, addr, addrlen)` | 建立连接 |
-| `async::close(fd)` | 关闭文件描述符 |
-| `async::shutdown(fd, how)` | 关闭读写通道 |
-| `async::yield()` | 让出执行权 |
-| `async::timeout(dur)` | 定时器 |
-
-### 网络抽象
-
-| API | 说明 |
-|---|---|
-| `socket` | RAII socket 包装 + async I/O |
-| `acceptor` | TCP 监听器 |
-| `inet_address` | IPv4/IPv6 地址 + DNS |
-
-### 同步原语
-
-| API | 说明 |
-|---|---|
-| `mutex` | 协程互斥锁（无锁 CAS 快速路径） |
-| `condition_variable` | 协程条件变量 |
-| `counting_semaphore` | 协程计数信号量 |
-| `channel<T, N>` | CSP 通道（0=会合, 1=单缓冲, N=多缓冲） |
+| 类别 | 关键 API |
+|------|---------|
+| **核心** | `task<T>`, `io_context`, `shared_task<T>`, `generator<T>` |
+| **I/O** | `async::recv/send/accept/connect/close/timeout/yield/read/write` |
+| **网络** | `socket`, `acceptor`, `inet_address` |
+| **同步** | `mutex`, `condition_variable`, `counting_semaphore`, `channel<T,N>` |
+| **组合** | `all()`, `any()`, `some()`, `defer{}` |
 
 ---
 
