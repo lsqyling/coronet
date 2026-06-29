@@ -11,8 +11,11 @@ if(WIN32)
         mswsock)
 
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # Linux: io_uring proactor
+    # Linux: epoll proactor (default) or io_uring (CORONET_IOURING=ON)
     target_compile_definitions(coronet PUBLIC CORONET_PLATFORM_LINUX)
+    if(CORONET_IOURING)
+        target_compile_definitions(coronet PUBLIC CORONET_USE_IOURING)
+    endif()
 
     # Threads (required for std::thread)
     find_package(Threads REQUIRED)

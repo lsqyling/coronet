@@ -8,19 +8,22 @@
 file(GLOB_RECURSE coronet_common_sources CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
-# Exclude platform-specific directories
+# Exclude all platform-specific directories
 list(FILTER coronet_common_sources EXCLUDE REGEX "platform/iocp/")
 list(FILTER coronet_common_sources EXCLUDE REGEX "platform/io_uring/")
+list(FILTER coronet_common_sources EXCLUDE REGEX "platform/epoll/")
 
 # Add platform-specific sources
 if(WIN32)
-    file(GLOB_RECURSE coronet_win_sources CONFIGURE_DEPENDS
+    file(GLOB_RECURSE coronet_platform_sources CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/platform/iocp/*.cpp")
-    list(APPEND coronet_common_sources ${coronet_win_sources})
-else()
-    file(GLOB_RECURSE coronet_linux_sources CONFIGURE_DEPENDS
+elseif(CORONET_IOURING)
+    file(GLOB_RECURSE coronet_platform_sources CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/platform/io_uring/*.cpp")
-    list(APPEND coronet_common_sources ${coronet_linux_sources})
+else()
+    file(GLOB_RECURSE coronet_platform_sources CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/platform/epoll/*.cpp")
 endif()
+list(APPEND coronet_common_sources ${coronet_platform_sources})
 
 target_sources(coronet PRIVATE ${coronet_common_sources})

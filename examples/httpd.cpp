@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <exception>
 #include <fcntl.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #define S_ISREG(m) ((m) & _S_IFREG)
 #define MSG_MORE 0
@@ -64,7 +65,7 @@ void fatal_error(const char *syscall) {
 
 void check_for_index_file() {
     struct stat st;
-    int ret = stat("public/index.html", &st);
+    int ret = ::stat("public/index.html", &st);
     if (ret < 0) {
         log::e("ZeroHTTPd needs the \"public\" directory to be "
                "present in the current directory.\n");
@@ -238,7 +239,7 @@ task<> session(const int sockfd) {
      * Check if this is a normal/regular file and not a directory or
      * something else */
     struct stat path_stat;
-    if (stat(path.data(), &path_stat) == -1 || !S_ISREG(path_stat.st_mode)) {
+    if (::stat(path.data(), &path_stat) == -1 || !S_ISREG(path_stat.st_mode)) {
         log::i("404 Not Found: %s\n", path.data());
         co_await sock.send(http_404_content);
         co_return;

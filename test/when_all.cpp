@@ -1,6 +1,7 @@
-/// coronet when_all demo: wait for all tasks, get results via structured binding
+/// coronet when_all test: 等待所有任务完成，通过结构化绑定获取结果
+/// Wait for all tasks, get results via structured binding.
 #include <coronet/all.hpp>
-#include <iostream>
+#include <cassert>
 #include <cstdio>
 using namespace coronet;
 
@@ -24,16 +25,21 @@ task<void> f2() {
     co_return;
 }
 
-task<> run() {
+task<> run_and_stop(io_context& ctx) {
     auto [r0, r1] = co_await all(f0(), f1(), f2());
-    std::cout << "get the result of f0: " << r0 << "\n";
-    std::cout << "get the result of f1: " << r1 << "\n";
+    // 验证结果 / Verify results
+    assert(r0 == 1);
+    assert(r1 == "f1 Great!");
+    printf("get the result of f0: %d\n", r0);
+    printf("get the result of f1: %s\n", r1.c_str());
+    printf("when_all test PASSED\n");
+    ctx.can_stop();
 }
 
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     io_context ctx;
-    ctx.co_spawn(run());
+    ctx.co_spawn(run_and_stop(ctx));
     ctx.start();
     ctx.join();
     return 0;

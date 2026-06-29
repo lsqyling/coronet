@@ -1,6 +1,7 @@
-/// coronet when_any demo: first completion wins, returns (index, variant)
+/// coronet when_any test: 首个完成者胜出，返回 (index, variant)
+/// First completion wins, returns (index, variant).
 #include <coronet/all.hpp>
-#include <iostream>
+#include <cassert>
 #include <variant>
 #include <cstdio>
 using namespace coronet;
@@ -25,23 +26,27 @@ task<void> f2() {
     co_return;
 }
 
-task<> run() {
+task<> run_and_stop(io_context& ctx) {
     auto [idx, var] = co_await any(f0(), f1(), f2());
-    std::cout << "get the result of f" << idx << ": ";
+    // f1 立即完成，应为胜者 / f1 completes immediately, should win
+    assert(idx == 1);
+    printf("get the result of f%zu: ", idx);
     std::visit(
         overload{
-            [](std::monostate) { std::cout << "(void)\n"; },
-            [](int x) { std::cout << x << " : int\n"; },
-            [](const std::string &s) { std::cout << s << " : string\n"; },
+            [](std::monostate) { printf("(void)\n"); },
+            [](int x) { printf("%d : int\n", x); },
+            [](const std::string &s) { printf("%s : string\n", s.c_str()); },
         },
         var
     );
+    printf("when_any test PASSED\n");
+    ctx.can_stop();
 }
 
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     io_context ctx;
-    ctx.co_spawn(run());
+    ctx.co_spawn(run_and_stop(ctx));
     ctx.start();
     ctx.join();
     return 0;

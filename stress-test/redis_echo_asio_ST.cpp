@@ -73,8 +73,8 @@ int main(int argc, char* argv[]) {
     uint16_t port = DefaultPort;
     if (argc > 1) port = static_cast<uint16_t>(std::atoi(argv[1]));
 
-    std::fprintf(stderr, "[ASIO] Starting Redis echo server (callback-based)\n");
-    std::fprintf(stderr, "[ASIO] Port: %d\n", port);
+    std::fprintf(stderr, "[ASIO ST] Starting Redis echo server (callback-based)\n");
+    std::fprintf(stderr, "[ASIO ST] Port: %d\n", port);
     std::fflush(stderr);
 
     asio::io_context io;

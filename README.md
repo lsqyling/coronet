@@ -1,218 +1,73 @@
 # coronet
 
-**跨平台高性能异步 I/O 库 · C++20 协程架构**
+**C++20 协程 · 跨平台 · 高性能异步 I/O 库**
 
-coronet 是一个基于 C++20 标准协程的异步 I/O 库，目标是在 **Linux**（io_uring）和 **Windows**（IOCP）上提供统一的协程化编程接口，让异步网络编程如同同步代码一样简单直观。
-
-> 本项目参考 [co_context](https://github.com/Code-Deng/co_context) 的架构设计，在其基础上重构为跨平台实现。
-
----
-
-## 目录
-
-- [设计哲学](#设计哲学)
-- [架构总览](#架构总览)
-- [核心技术要点](#核心技术要点)
-- [快速开始](#快速开始)
-- [协程应用示例](#协程应用示例)
-- [API 参考](#api-参考)
-- [双平台支持](#双平台支持)
-- [构建指南](#构建指南)
-- [测试与基准](#测试与基准)
-- [项目结构](#项目结构)
+<p align="center">
+  <img src="https://img.shields.io/badge/C++-20-blue" alt="C++20">
+  <img src="https://img.shields.io/badge/Linux-GCC%2013%20%7C%20Clang%2018-brightgreen" alt="Linux">
+  <img src="https://img.shields.io/badge/Windows-MSVC%2019.41-blue" alt="Windows">
+  <img src="https://img.shields.io/badge/I/O-epoll%20%7C%20io__uring%20%7C%20IOCP-orange" alt="IO">
+  <img src="https://img.shields.io/badge/test-22%2F22%20passed-success" alt="Tests">
+</p>
 
 ---
 
-## 设计哲学
+## ✨ 核心亮点
 
-### 为什么是 Proactor？
+| 🎯 | 特性 | 说明 |
+|:--:|------|------|
+| 🔌 | **三后端热插拔** | epoll（默认）⇄ io_uring（`-DCORONET_IOURING=ON`）⇄ IOCP（Windows 自动） |
+| 🖥️ | **全编译器跨平台** | Linux GCC 13 / Clang 18 + Windows MSVC 19.41，一套代码 |
+| ⚡ | **编译期零开销多态** | CRTP + `#ifdef` 平台选择，无虚表、无堆分配 Proactor |
+| 🔗 | **链式 co_await** | `co_await (recv && send)` 单次挂起完成两个 I/O 操作 |
+| 🧵 | **协程同步原语** | mutex / condition_variable / semaphore / channel / when_all·any·some |
+| 📊 | **统一压测驱动** | `stress_driver --server name:binary:port` 自动采集 RPS + CPU + 内存 |
 
-I/O 模型分为两大类：
+## 🚀 性能速览
 
-| 模型 | 代表 | 工作方式 | 协程友好度 |
-|---|---|---|---|
-| **Reactor** | epoll, kqueue | 通知"可读/可写"，用户负责读写 | ❌ 需手动管理缓冲区 |
-| **Proactor** | IOCP, io_uring | 内核完成读写后通知结果 | ✅ `co_await` 直接获得结果 |
+**Redis PING 服务, 100K 请求 × 50 并发, WSL2 epoll**
 
-Linux **io_uring** 和 Windows **IOCP** 都是 Proactor 模式——操作系统内核异步完成 I/O 操作后通知用户程序。coronet 在此基础上抽象出一层统一的 Proactor 接口，向上层提供一致的协程体验。
+| 服务端 | RPS | CPU% | 内存 |
+|--------|-----:|:---:|-----:|
+| coronet ST (协程) | 19,952 | 83.6% | 3.9 MB |
+| coronet chain (链式) | 14,051 | 87.1% | 3.9 MB |
+| ASIO ST (回调) | 19,175 | 73.2% | 3.7 MB |
 
-### 两级调度
+**三平台峰值 RPS（单线程）**
 
-```
-协程链（内联执行）          I/O 完成（调度器介入）
-┌─────────────┐           ┌──────────────────┐
-│ task A      │           │ io_uring / IOCP  │
-│   co_await B│──内联──▶   │   完成事件到达    │
-│   co_await C│──内联──▶   │   → 推入 reap    │
-│   ...       │           │   → resume 协程   │
-└─────────────┘           └──────────────────┘
-```
+| 编译器 | coronet | 后端 |
+|--------|-----:|------|
+| MSVC 19.41 (Windows) | **58,384** 🏆 | IOCP |
+| GCC 13.3 (Linux) | 48,662 | io_uring |
+| Clang 18.1 (Linux) | 47,304 | io_uring |
 
-- **内联路径**：`task<>` 链通过 `parent_coro` 直连，零调度开销
-- **调度路径**：I/O 完成事件通过无锁 SPSC 环形队列（reap_swap）传递
-
----
-
-## 架构总览
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    用户代码 (User Code)                   │
-│  task<> / shared_task<> / generator<>                   │
-│  async::recv / async::send / ...                        │
-│  mutex / condition_variable / semaphore / channel       │
-│  socket / acceptor / inet_address                       │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────┐
-│                   io_context (事件循环)                   │
-│                                                         │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  worker_meta                                      │   │
-│  │  ┌─────────────┐  ┌──────────────────────────┐   │   │
-│  │  │  reap_swap   │  │  proactor*               │   │   │
-│  │  │  (SPSC Ring) │  │  (平台抽象)              │   │   │
-│  │  └─────────────┘  └───────────┬──────────────┘   │   │
-│  └──────────────────────────────────────────────────┘   │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-          ┌────────────┴────────────┐
-          ▼                         ▼
-┌──────────────────┐    ┌──────────────────┐
-│ io_uring_proactor│    │ iocp_proactor    │
-│   (Linux)        │    │   (Windows)      │
-│                  │    │                  │
-│ • get_sq_entry() │    │ • GetQueued-     │
-│ • submit_and_wait│    │   Completion-    │
-│ • peek_cq_entry()│    │   Status         │
-│ • cq_advance()   │    │ • PostQueued-    │
-│                  │    │   Completion-    │
-│                  │    │   Status         │
-└──────────────────┘    └──────────────────┘
-```
-
-### 核心组件
-
-| 组件 | 职责 |
-|---|---|
-| **`io_context`** | 事件循环调度器，每线程一个实例 |
-| **`worker_meta`** | 管理 ready 队列 + I/O 提交/收割 |
-| **`proactor`** | 平台抽象基类（io_uring / IOCP） |
-| **`task<T>`** | 惰性协程任务，move-only，parent-chain |
-| **`shared_task<T>`** | 引用计数多等待者 |
-| **`lazy_*` awaiters** | 具体 I/O awaitable（recv/send/accept/...） |
+> 完整报告 → [doc/aio_PR.md](doc/aio_PR.md) | 测试报告 → [doc/test_Report.md](doc/test_Report.md)
 
 ---
 
-## 核心技术要点
-
-### 1. 惰性执行 (Lazy Execution)
-
-`task<T>` 在 `initial_suspend()` 返回 `suspend_always`，协程体不会自动开始执行。只有被 `co_await` 时才会运行：
-
-```cpp
-task<int> compute() { co_return 42; }
-
-task<void> example() {
-    auto t = compute();     // ❌ 尚未开始执行
-    int v = co_await t;     // ✅ 开始执行并等待结果
-}
-```
-
-### 2. 零开销父链 (Zero-Overhead Parent Chain)
-
-`task_final_awaiter::await_suspend()` 直接返回父协程句柄，控制权同步转移，无需调度器介入：
-
-```cpp
-// 编译器展开后的流程：
-child 完成 → final_suspend → return parent_handle → 恢复父协程
-// 全程无调度器、无锁、无原子操作
-```
-
-### 3. 无锁 SPSC 环形队列
-
-`reap_swap` 是一个单生产者单消费者的无锁环形缓冲区，用于从 I/O 完成事件到协程恢复的传递：
-
-```
-生产者（I/O 完成）： push(handle) → tail++
-消费者（事件循环）： pop() → head++
-当 head == tail 时，队列为空
-```
-
-### 4. 平台抽象 Proactor（静态多态）
-
-```cpp
-// C++20 concept — 编译期类型检查，零虚函数开销
-template<typename T>
-concept proactor_concept = requires(T p, completion_info* info) {
-    { p.init(entries) } -> std::same_as<void>;
-    { p.submit(false) } -> std::same_as<int>;
-    { p.wait_completion(info) } -> std::same_as<int>;
-    { p.wakeup() } -> std::same_as<void>;
-};
-```
-
-- **Linux**: `io_uring_proactor` — 直接操作 io_uring SQ/CQ 环形缓冲区，eventfd 唤醒
-- **Windows**: `iocp_proactor` — 封装 IOCP (CreateIoCompletionPort, GetQueuedCompletionStatus)，per-thread operation recycling
-
-### 5. 平台无关 I/O 工厂
-
-```cpp
-namespace coronet::async {
-    auto recv(int fd, std::span<char> buf, int flags = 0) noexcept;
-    auto send(int fd, std::span<const char> buf, int flags = 0) noexcept;
-    auto accept(int fd, sockaddr* addr, socklen_t* addrlen, int flags) noexcept;
-    auto connect(int fd, const sockaddr* addr, socklen_t addrlen) noexcept;
-    auto close(int fd) noexcept;
-    auto yield() noexcept;
-    auto timeout(auto dur) noexcept;
-}
-```
-
-每个工厂函数在编译期根据平台宏分派到具体实现：
-- Linux → `detail::io_uring_recv{fd, buf, flags}`（直接填充 SQE）
-- Windows → `detail::win_recv{(uintptr_t)fd, buf, flags}`（记录参数，await_suspend 时发起 WSARecv）
-
----
-
-## 快速开始
-
-### 依赖
-
-- C++20 编译器（GCC 13+, MSVC 19.41+, Clang 14+）
-- CMake 3.20+
-- Linux: 内核 5.19+（推荐 6.1+）
-- Windows: Windows 8+（IOCP）
-
-### 构建
+## ⚡ 快速开始
 
 ```bash
-# Linux
-git clone https://github.com/your/coronet.git
-cd coronet
-mkdir build && cd build
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
-cmake --build .
-ctest --output-on-failure
+# 克隆
+git clone https://github.com/lsqyling/coronet.git && cd coronet
 
-# Windows (需先执行 vcvars64.bat)
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
-cmake --build .
-ctest --output-on-failure
+# Linux — 默认 epoll 后端
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCORONET_BUILD_TESTS=ON -DCORONET_BUILD_BENCHMARKS=ON
+cmake --build build
+cd build && ctest --output-on-failure
+
+# 切换到 io_uring
+cmake -S . -B build-uring -G Ninja -DCORONET_IOURING=ON
+cmake --build build-uring
+
+# Windows MSVC (Developer Command Prompt)
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest -C Release --output-on-failure
 ```
 
-### CMake 选项
-
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `CORONET_BUILD_TESTS` | ON | 构建 gtest 单元测试 |
-| `CORONET_BUILD_BENCHMARKS` | OFF | 构建 Google Benchmark |
-| `CORONET_BUILD_EXAMPLES` | ON | 构建示例程序 |
-| `CORONET_USE_MIMALLOC` | OFF | 使用 mimalloc 优化分配 |
-
----
-
-## 协程应用示例
+## 📖 30 秒示例
 
 ### Echo Server
 
@@ -220,203 +75,183 @@ ctest --output-on-failure
 #include <coronet/coronet.hpp>
 using namespace coronet;
 
-// 单个连接的处理协程
 task<> session(int fd) {
     char buf[1024];
     while (true) {
         int n = co_await async::recv(fd, buf);
-        if (n <= 0) break;           // 连接关闭或错误
-        co_await async::send(fd, {buf, (size_t)n});  // 回显
+        if (n <= 0) break;
+        co_await async::send(fd, {buf, (size_t)n});
     }
-    co_await async::close(fd);
 }
 
-// 主监听协程
 task<> server(uint16_t port) {
     acceptor ac{inet_address{port}};
-    while (true) {
-        int fd = co_await ac.accept();           // await 新连接
-        co_spawn(session(fd));                   // spawn 处理协程
-    }
+    while (true)
+        co_spawn(session(co_await ac.accept()));
 }
 
 int main() {
     io_context ctx;
     ctx.co_spawn(server(8080));
-    ctx.start();
-    ctx.join();    // 永不返回（除非收到停止信号）
-}
-```
-
-### 多线程并发
-
-```cpp
-// 创建多个 io_context，每个运行在自己的线程上
-std::vector<io_context> ctxs(4);
-for (auto& ctx : ctxs) ctx.start();
-
-// 通过 shared_task 在多个 context 间共享结果
-shared_task<int> shared = compute();
-
-// 可在任意线程 co_await 同一个 shared_task
-for (auto& ctx : ctxs) {
-    ctx.co_spawn(worker(shared));
-}
-for (auto& ctx : ctxs) ctx.join();
-```
-
-### 定时器
-
-```cpp
-task<> tick() {
-    while (true) {
-        printf("tick\n");
-        co_await async::timeout(std::chrono::seconds(1));
-    }
+    ctx.start(); ctx.join();
 }
 ```
 
 ### 同步原语
 
 ```cpp
-// 使用 mutex 保护共享资源
+// 互斥锁
 mutex mtx;
-int shared_counter = 0;
-
-task<> increment() {
-    auto guard = co_await mtx.lock_guard();  // RAII 锁
-    ++shared_counter;
-}   // 自动释放
-
-// 使用 channel 在协程间通信
-channel<int, 64> ch;
-
-task<> producer() {
-    for (int i = 0; i < 100; ++i)
-        co_await ch.release(i);
+task<> critical() {
+    auto g = co_await mtx.lock_guard();
+    /* 临界区 */
 }
 
-task<> consumer() {
-    for (int i = 0; i < 100; ++i) {
-        int v = co_await ch.acquire();
-        printf("got %d\n", v);
-    }
+// 信号量 — 10 协程竞争 3 槽位
+counting_semaphore sem{3};
+task<> worker() { co_await sem.acquire(); /* ... */ sem.release(); }
+
+// 条件变量
+condition_variable cv; mutex m;
+task<> waiter() {
+    auto lk = co_await m.lock_guard();
+    co_await cv.wait(m, [] { return ready; });
 }
+
+// CSP 通道 — 生产者/消费者
+channel<std::string, 4> ch;
+task<> producer() { co_await ch.release("msg"); }
+task<> consumer() { auto s = co_await ch.acquire(); }
+```
+
+### 协程组合器 + 链式 I/O
+
+```cpp
+// 等待全部完成
+auto [r0, r1] = co_await all(taskA(), taskB(), taskC());
+
+// 首个完成者胜出
+auto [idx, var] = co_await any(taskA(), taskB());
+
+// 链式 co_await — 发送 PONG 同时接收下一条 PING
+co_await (async::send(fd, pong) && async::recv(fd, buf));
 ```
 
 ---
 
-## API 参考
+## 🏗️ 架构
 
-完整 API 手册（14 节，含代码示例）→ **[doc/api_Manual.md](doc/api_Manual.md)**
+```
+用户代码: task<> / shared_task<> / generator<>
+   ↓ co_await
+async::recv / send / accept / connect / timeout / ...
+   ↓ 工厂函数 (编译期分派)
+┌──────────┬──────────────┬──────────┐
+│  epoll   │   io_uring   │   IOCP   │  ← 三后端, 编译期选择
+│ (默认)   │ (CORONET_   │ (Windows │
+│          │   IOURING=ON)│  自动)   │
+└──────────┴──────────────┴──────────┘
+   ↓
+io_context (单线程事件循环)
+   ├─ drain_cross_thread()   跨线程队列 → SPSC 环
+   ├─ do_worker_part()       SPSC 环 → resume 协程
+   ├─ do_submission_part()   提交 I/O (仅 io_uring)
+   └─ do_completion_part()   收割完成事件
+```
 
-| 类别 | 关键 API |
-|------|---------|
-| **核心** | `task<T>`, `io_context`, `shared_task<T>`, `generator<T>` |
-| **I/O** | `async::recv/send/accept/connect/close/timeout/yield/read/write` |
-| **网络** | `socket`, `acceptor`, `inet_address` |
-| **同步** | `mutex`, `condition_variable`, `counting_semaphore`, `channel<T,N>` |
-| **组合** | `all()`, `any()`, `some()`, `defer{}` |
+| 组件 | 职责 |
+|------|------|
+| `io_context` | 单线程事件循环，栈上 Proactor |
+| `worker_meta` | SPSC 无锁环 + 跨线程队列 + I/O 计数器 |
+| `task<T>` | 惰性协程，父链内联恢复（零调度开销） |
+| `shared_task<T>` | 引用计数多等待者 |
+| `epoll_awaiter_base<D>` | CRTP 编译期多态（非虚函数） |
 
 ---
 
-## 双平台支持
+## 📦 CMake 选项
 
-| 特性 | Linux | Windows |
-|---|---|---|
-| 异步 I/O 后端 | io_uring | IOCP |
-| Proactor 实现 | `io_uring_proactor` | `iocp_proactor` |
-| 事件提交 | `io_uring_enter()` / `submit_and_wait()` | `PostQueuedCompletionStatus()` |
-| 事件收割 | `peek_cq_entry()` / `cq_advance()` | `GetQueuedCompletionStatus()` |
-| socket 创建 | `socket()` + SOCK_CLOEXEC | `WSASocketW()` + WSA_FLAG_OVERLAPPED |
-| socket I/O | `prep_recv()` / `prep_send()` | `WSARecv()` / `WSASend()` |
-| close | `close()` | `closesocket()` |
-| 地址族 | `sa_family_t` | `u_short` |
-| 地址长度 | `socklen_t` | `int` |
+| 选项 | 默认 | 说明 |
+|------|:---:|------|
+| `CORONET_IOURING` | OFF | 启用 io_uring 替代 epoll |
+| `CORONET_BUILD_TESTS` | ON* | 21 项单元+集成测试 (CTest) |
+| `CORONET_BUILD_BENCHMARKS` | ON | Google Benchmark 微基准 |
+| `CORONET_BUILD_STRESS_TESTS` | OFF | 压力测试 (redis-benchmark + redis_loadgen) |
+| `CORONET_BUILD_EXAMPLES` | ON* | 示例程序 |
+
+> \* `PROJECT_IS_TOP_LEVEL` 时默认 ON
 
 ---
 
-## 构建指南
-
-### Linux (WSL / 原生)
+## 🧪 CTest 测试矩阵
 
 ```bash
-# 依赖：g++-13, cmake, ninja
-sudo apt install g++-13 cmake ninja-build
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
+# 运行全部
+ctest --output-on-failure -j4
+
+# 分类运行
+ctest -R gtest          # 单元测试 (18 用例)
+ctest -R benchmark      # Google Benchmark
+ctest -R stress_driver  # 压测 (ST / MT)
 ```
 
-### Windows (Visual Studio 2022)
-
-```powershell
-# 从 Visual Studio Developer Command Prompt (x64) 运行
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
+| 平台 / 编译器 | 后端 | 测试数 | 结果 |
+|:---|:---|:---:|:---:|
+| Linux GCC 13.3 | epoll | 22/22 | ✅ |
+| Linux Clang 18.1 | epoll | 22/22 | ✅ |
+| Linux GCC 13.3 | io_uring | 22/22 | ✅ |
+| Windows MSVC 19.41 | IOCP | 21/21 | ✅ |
 
 ---
 
-## 三平台性能 (Redis PING 服务, 100K 请求)
+## 🔬 压力测试
 
-### 单线程
+```bash
+# 构建
+cmake -S . -B build -DCORONET_BUILD_STRESS_TESTS=ON
+cmake --build build
 
-| c | coronet GCC | co_context GCC | ASIO GCC | coronet Clang | coronet MSVC | ASIO MSVC |
-|:--:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 10 | 37,764 | 42,680 | **43,630** | 40,800 | **53,361** | 54,957 |
-| 50 | 43,197 | **49,850** | 47,192 | **47,304** | **58,384** 🏆 | 47,045 |
-| 200 | 38,197 | 43,011 | **53,591** | 41,085 | **46,463** | 44,876 |
-| 500 | **48,662** | 42,517 | 42,391 | 41,754 | **44,210** | 44,134 |
+# CTest 单线程对比
+ctest -R stress_driver_ST
 
-### 多线程 (6线程)
+# 手动 — 自定义服务端
+./stress_driver \
+  --server "coronet_ST:redis_echo_ST:6380" \
+  --server "ASIO_ST:redis_echo_asio_ST:6382" \
+  -n 100000 -c 100 -v
+```
 
-| c | coronet GCC | ASIO GCC | coronet Clang | ASIO Clang | coronet MSVC | ASIO MSVC |
-|:--:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 10 | 18,005 | **29,700** | 25,439 | **30,303** | **56,101** | 52,961 |
-| 100 | 35,651 | **37,750** | 33,979 | 25,681 | **51,571** | 49,545 |
-| 500 | 32,992 | **34,626** | **38,226** | 30,039 | **44,115** | 41,062 |
-
-**三平台 70 次压测零崩溃**。完整报告：[doc/aio_PR.md](doc/aio_PR.md)
+添加新服务端**无需改 stress_driver 代码** — 在 CMakeLists 中追加 `--server name:binary:port` 即可。
 
 ---
 
-## 项目结构
+## 📂 目录
 
 ```
 coronet/
-├── include/coronet/           # 公共 API 头文件
-│   ├── task.hpp               # 惰性协程任务
-│   ├── generator.hpp          # P2502R2 生成器
-│   ├── shared_task.hpp        # 引用计数多等待者
-│   ├── io_context.hpp         # 事件循环调度器
-│   ├── async_io.hpp           # 跨平台 I/O 工厂
-│   ├── net/                   # socket/acceptor/inet_address
-│   ├── co/                    # mutex/CV/semaphore/channel
-│   ├── platform/              # proactor 抽象 + 平台实现
-│   └── detail/                # 内部实现细节
-├── lib/coronet/               # 编译后实现 (.cpp)
-├── extern/                    # 第三方依赖
-│   ├── liburingcxx/           # io_uring C++ wrapper
-│   ├── googletest/            # 单元测试框架
-│   └── benchmark/             # 性能基准框架
-├── test/                      # 单元测试
-├── bench/                     # 性能基准
-├── examples/                  # 示例程序
-├── script/                    # 构建脚本
-└── doc/                       # 文档
+├── include/coronet/       # 公共头文件
+│   ├── task.hpp           #   惰性协程
+│   ├── async_io.hpp       #   跨平台 I/O 工厂
+│   ├── io_context.hpp     #   事件循环
+│   ├── net/               #   socket / acceptor
+│   ├── co/                #   mutex / cv / sem / channel
+│   ├── platform/          #   epoll / io_uring / IOCP
+│   └── detail/            #   内部实现
+├── lib/coronet/           # .cpp 实现
+├── test/                  # 21 项 CTest
+├── bench/                 # Google Benchmark
+├── stress-test/           # 压测驱动 + 服务端
+├── examples/              # 示例程序
+├── doc/                   # 性能报告 / API 手册
+└── cmake/                 # CMake 模块
 ```
 
 ---
 
-## License
+## 📜 许可
 
 MIT License
 
-## Acknowledgments
+---
 
-- [co_context](https://github.com/Codesire-Deng/co_context) — Architecture reference
-- [liburingcxx](https://github.com/Codesire-Deng/co_context/tree/master/extern/liburingcxx) — io_uring C++ wrapper
-- [ASIO](https://think-async.com/Asio/) — IOCP patterns reference
-- [P2502R2](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p2502r2.pdf) — `std::generator` reference implementation
+<sub>本项目代码由 **Claude Code** (Anthropic) 辅助生成，采用 AI Vibe Coding 开发方式。人工进行需求定义、架构设计审核、代码审查及测试验证。</sub>

@@ -2,8 +2,8 @@
 # External dependencies (bundled in extern/)
 # ============================================================
 
-# ---- liburingcxx (Linux, internal dependency) ----
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# ---- liburingcxx (only when CORONET_IOURING=ON) ----
+if(CORONET_IOURING)
     find_package(liburingcxx QUIET)
     if(liburingcxx_FOUND)
         target_link_libraries(coronet PUBLIC liburingcxx::liburingcxx)
@@ -14,7 +14,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_link_libraries(coronet PUBLIC liburingcxx::liburingcxx)
             message(STATUS "coronet: using bundled liburingcxx")
         else()
-            message(WARNING "coronet: liburingcxx not found; io_uring proactor may be incomplete")
+            message(FATAL_ERROR "coronet: CORONET_IOURING=ON but liburingcxx not found")
         endif()
     endif()
 endif()
@@ -44,5 +44,5 @@ if(CORONET_BUILD_BENCHMARKS AND EXISTS "${PROJECT_SOURCE_DIR}/extern/benchmark/C
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
-    add_subdirectory(extern/benchmark EXCLUDE_FROM_ALL)
+    add_subdirectory(extern/benchmark)
 endif()

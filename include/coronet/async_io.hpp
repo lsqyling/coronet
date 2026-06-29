@@ -1,9 +1,26 @@
-/// Async I/O factory functions (cross-platform).
-/// Platform dispatch via factory functions in platform_io namespace — C++20 style.
+// ============================================================
+// async_io.hpp — 跨平台异步 I/O 工厂函数
+// ============================================================
+// 统一的公共 API，通过 platform_io 命名空间中的工厂函数实现平台分派。
+// 编译期选择（零虚表开销）：
+//   Linux + IOURING → io_uring_lazy_io.hpp  → detail::platform_io::make_*
+//   Linux 默认      → epoll_lazy_io.hpp      → detail::platform_io::make_*
+//   Windows         → iocp_win_io.hpp        → detail::platform_io::make_*
+//
+// 所有函数返回 awaitable 对象，标记 [[nodiscard]] 防止忘记 co_await。
+//
+// Async I/O factory functions (cross-platform).
+// Platform dispatch via factory functions in platform_io namespace — C++20 style.
+
 #pragma once
 
+// 三路编译期平台选择 / Three-way compile-time platform selection
 #if defined(CORONET_PLATFORM_LINUX)
-#include "coronet/platform/io_uring/io_uring_lazy_io.hpp"
+  #if defined(CORONET_USE_IOURING)
+    #include "coronet/platform/io_uring/io_uring_lazy_io.hpp"
+  #else
+    #include "coronet/platform/epoll/epoll_lazy_io.hpp"
+  #endif
 #else
 #include "coronet/platform/iocp/iocp_win_io.hpp"
 #endif
@@ -16,7 +33,7 @@ namespace coronet {
 inline namespace async {
 
 // ============================================================
-// Socket operations
+// 套接字操作 / Socket operations
 // ============================================================
 
 [[nodiscard("Did you forget to co_await?")]]
@@ -46,8 +63,11 @@ inline auto shutdown(int fd, int how) noexcept
     { return detail::platform_io::make_shutdown(fd, how); }
 
 // ============================================================
-// File I/O
+// 文件 I/O / File I/O
 // ============================================================
+// epoll 不支持普通文件 → 后台线程 + pipe 信号
+// io_uring 原生支持 → 内核直接执行
+// IOCP 不支持普通文件 → 后台线程
 
 [[nodiscard("Did you forget to co_await?")]]
 inline auto read(int fd, std::span<char> buf,
@@ -59,8 +79,9 @@ inline auto write(int fd, std::span<const char> buf,
                   uint64_t offset = uint64_t(-1)) noexcept
     { return detail::platform_io::make_write(fd, buf, offset); }
 
-// openat is Linux-only (io_uring specific)
-#if defined(CORONET_PLATFORM_LINUX)
+// openat 仅 io_uring 支持（内核级异步文件打开）
+// openat is io_uring-only (kernel-level async file open)
+#if defined(CORONET_USE_IOURING)
 [[nodiscard("Did you forget to co_await?")]]
 inline auto openat(int dirfd, const char* path, int flags,
                    mode_t mode = 0) noexcept {
@@ -69,17 +90,21 @@ inline auto openat(int dirfd, const char* path, int flags,
 #endif
 
 // ============================================================
-// Control / yield / timeout
+// 控制操作 / Control: yield / timeout
 // ============================================================
+// yield：提交空操作，让出控制权给事件循环一轮
+// timeout：定时器，到期后恢复协程（io_uring 用 IORING_OP_TIMEOUT，epoll 用 timerfd，IOCP 用后台线程）
 
 [[nodiscard("Did you forget to co_await?")]]
 inline auto yield() noexcept
     { return detail::platform_io::make_yield(); }
 
+/// 相对超时 / Relative timeout
 [[nodiscard("Did you forget to co_await?")]]
 inline auto timeout(auto dur) noexcept
     { return detail::platform_io::make_timeout(dur); }
 
+/// 绝对时间点超时 / Absolute time-point timeout
 [[nodiscard("Did you forget to co_await?")]]
 inline auto timeout_at(auto time_point) noexcept {
     auto dur = std::chrono::duration_cast<std::chrono::nanoseconds>(

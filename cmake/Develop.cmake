@@ -11,8 +11,9 @@ if(CORONET_BUILD_TESTS)
 endif()
 
 if(CORONET_BUILD_BENCHMARKS)
-    # bench/ directory created in Phase 4
-    if(EXISTS "${PROJECT_SOURCE_DIR}/bench/CMakeLists.txt")
-        add_subdirectory(bench)
-    endif()
+    add_subdirectory(bench)
+endif()
+
+if(CORONET_BUILD_STRESS_TESTS)
+    add_subdirectory(stress-test)
 endif()

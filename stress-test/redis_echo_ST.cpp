@@ -29,7 +29,7 @@ coronet::task<> redis_session(int sockfd) {
 
 coronet::task<> redis_server(uint16_t port) {
     coronet::acceptor ac{coronet::inet_address{port}};
-    std::fprintf(stderr, "[coronet] listening on port %d\n", port);
+    std::fprintf(stderr, "[coronet ST] listening on port %d\n", port);
     std::fflush(stderr);
 
     while (true) {
@@ -45,8 +45,8 @@ int main(int argc, char* argv[]) {
     if (argc > 1) port = static_cast<uint16_t>(std::atoi(argv[1]));
 
     // Use stderr for unbuffered startup messages
-    std::fprintf(stderr, "[coronet] Starting Redis echo server (coroutine-based)\n");
-    std::fprintf(stderr, "[coronet] Port: %d\n", port);
+    std::fprintf(stderr, "[coronet ST] Starting Redis echo server (coroutine-based)\n");
+    std::fprintf(stderr, "[coronet ST] Port: %d\n", port);
     std::fflush(stderr);
 
     coronet::io_context ctx;

@@ -111,11 +111,11 @@ void io_context::do_worker_part() {
 }
 
 void io_context::do_submission_part() noexcept {
-#if defined(CORONET_PLATFORM_LINUX)
+#if defined(CORONET_USE_IOURING)
     // io_uring: submit batched SQEs
     worker_.poll_submission();
 #else
-    // IOCP: no-op — operations are issued synchronously in issue_io()
+    // epoll / IOCP: no-op — operations are issued in await_suspend
     (void)0;
 #endif
 }
