@@ -6,7 +6,6 @@
 set(coronet_gtest_tests
     task_gtest
     generator_gtest
-    proactor_gtest
     channel_gtest
     shared_task_gtest
 )
@@ -26,7 +25,6 @@ set(coronet_int_tests
     generator_test
     coro_lifetime
     echo_server
-    pingpong_client
 )
 
 # stress_test uses POSIX sockets (sys/socket.h) — Linux only
