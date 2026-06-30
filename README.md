@@ -263,4 +263,4 @@ coronet/
 [Apache License](./LICENSE)
 ---
 
-<sub>本项目代码由 **Claude Code** (Anthropic) 辅助生成，采用 AI Vibe Coding 开发方式。人工进行需求定义、架构设计审核、代码审查及测试验证。</sub>
+<sub>本项目代码由 **Claude Code** (Deepseek) 辅助生成，采用 AI Vibe Coding 开发方式。人工进行需求定义、架构设计审核、代码审查及测试验证。</sub>
