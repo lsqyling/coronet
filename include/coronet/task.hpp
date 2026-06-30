@@ -1,5 +1,4 @@
-#ifndef CORONET_TASK_HPP
-#define CORONET_TASK_HPP
+#pragma once
 
 #include <coroutine>
 #include <memory>
@@ -761,35 +760,19 @@ private:
 
 namespace detail {
 template<typename T>
-inline task<T> task_promise<T>::get_return_object() noexcept
-{
+inline task<T> task_promise<T>::get_return_object() noexcept {
     return task<T>{std::coroutine_handle<task_promise>::from_promise(*this)};
 }
 
-inline task<void> task_promise<void>::get_return_object() noexcept
-{
+inline task<void> task_promise<void>::get_return_object() noexcept {
     return task<void>{std::coroutine_handle<task_promise>::from_promise(*this)};
 }
 
 template<typename T>
-inline task<T &> task_promise<T &>::get_return_object() noexcept
-{
+inline task<T &> task_promise<T &>::get_return_object() noexcept {
     return task<T &>{std::coroutine_handle<task_promise>::from_promise(*this)};
 }
 
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 }
-#endif
