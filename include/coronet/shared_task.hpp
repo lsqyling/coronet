@@ -154,7 +154,7 @@ private:
 } // namespace detail
 
 template<typename T = void>
-class [[nodiscard]] shared_task {
+class shared_task {
 public:
     using promise_type = detail::shared_task_promise<T>;
     using value_type = T;

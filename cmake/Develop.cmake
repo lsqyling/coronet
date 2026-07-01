@@ -1,7 +1,13 @@
 # ============================================================
 # Development targets: tests, examples, benchmarks
 # ============================================================
-
+if (CORONET_DEVELOPER_MODE)
+    set(CORONET_BUILD_EXAMPLES ON)
+    set(CORONET_BUILD_TESTS ON)
+    set(CORONET_BUILD_BENCHMARKS ON)
+    set(CORONET_BUILD_STRESS_TESTS ON)
+endif ()
+message("CORONET_DEVELOPER_MODE: ${CORONET_DEVELOPER_MODE}")
 if(CORONET_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()

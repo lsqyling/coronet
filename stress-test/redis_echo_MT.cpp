@@ -1,9 +1,13 @@
-/// coronet multi-threaded Redis echo server (multi-port approach).
-/// Each worker has its own io_context + port. Run all in parallel.
-/// Usage: ./redis_echo_MT_reuseport [base_port] [threads]
+/// coronet multi-threaded Redis echo server — shared-port model.
+/// Uses cross-thread co_spawn to distribute accepted connections
+/// across N io_context workers, all sharing a single listen port.
 ///
-/// For comparison with co_context's cross-thread co_spawn pattern,
-/// we test throughput by running load across all worker ports simultaneously.
+/// Architecture (comparable to ASIO_MT):
+///   - 1 acceptor coroutine on worker[0] → single port
+///   - N worker io_contexts (1 thread each) → N event loops
+///   - Accepted sessions distributed round-robin via cross-thread co_spawn
+///
+/// Usage: ./redis_echo_MT [port] [threads]
 
 #include <coronet/coronet.hpp>
 #include <coronet/io_context.hpp>
@@ -14,15 +18,16 @@
 #include <thread>
 #include <vector>
 
-constexpr int DefaultBasePort = 6380;
+constexpr int DefaultPort    = 6379;
 constexpr int DefaultThreads = 6;
-constexpr int BufSize = 4096;
+constexpr int BufSize        = 4096;
 
+/// Per-session coroutine — recv / send PONG in a loop
 coronet::task<> redis_session(int sockfd) {
     coronet::socket sock{sockfd};
     char buf[BufSize];
-    constexpr const char* pong = "+PONG\r\n";
-    constexpr int pong_len = 7;
+    constexpr const char* pong     = "+PONG\r\n";
+    constexpr int         pong_len = 7;
 
     while (true) {
         int nr = co_await sock.recv(buf);
@@ -32,41 +37,59 @@ coronet::task<> redis_session(int sockfd) {
     }
 }
 
-coronet::task<> redis_worker(uint16_t port, int worker_id) {
+/// Acceptor coroutine — runs on worker[0], distributes sessions to all workers
+coronet::task<> acceptor_task(uint16_t port,
+                              std::vector<coronet::io_context>& workers,
+                              int nworkers) {
     coronet::acceptor ac{coronet::inet_address{port}};
-    std::fprintf(stderr, "[worker %d] port=%d\n", worker_id, port);
+    std::fprintf(stderr, "[coronet MT] listening on port %d (%d workers)\n",
+                 port, nworkers);
     std::fflush(stderr);
 
+    int next = 0;
     while (true) {
         int sock = co_await ac.accept();
         if (sock >= 0) {
-            coronet::co_spawn(redis_session(sock));
+            // Round-robin distribute to workers via cross-thread co_spawn
+            workers[next].co_spawn(redis_session(sock));
+            next = (next + 1) % nworkers;
         }
     }
 }
 
 int main(int argc, char* argv[]) {
-    int base_port = DefaultBasePort;
-    if (argc > 1) base_port = std::atoi(argv[1]);
+    uint16_t port = DefaultPort;
+    if (argc > 1) port = static_cast<uint16_t>(std::atoi(argv[1]));
+
     int nthreads = DefaultThreads;
     if (argc > 2) nthreads = std::atoi(argv[2]);
     if (nthreads < 1) nthreads = 1;
 
-    std::fprintf(stderr, "[coronet MT] %d workers, ports %d-%d\n",
-                 nthreads, base_port, base_port + nthreads - 1);
+    std::fprintf(stderr, "[coronet MT] %d workers, shared port %d\n",
+                 nthreads, port);
     std::fflush(stderr);
 
+    // Create N io_contexts — one per worker thread
     std::vector<coronet::io_context> workers(nthreads);
-    std::vector<std::thread> threads;
 
+    // Spawn acceptor coroutine on worker[0]
+    workers[0].co_spawn(acceptor_task(port, workers, nthreads));
+
+    // Launch host threads for all workers
+    std::vector<std::thread> starter_threads;
     for (int i = 0; i < nthreads; ++i) {
-        auto port = static_cast<uint16_t>(base_port + i);
-        workers[i].co_spawn(redis_worker(port, i));
-        threads.emplace_back([&workers, i] {
+        starter_threads.emplace_back([&workers, i] {
             workers[i].start();
         });
     }
 
-    for (auto& t : threads) t.join();
+    // Wait for all starter threads to finish (they return from start() quickly)
+    for (auto& t : starter_threads) t.join();
+
+    // Keep the process alive — workers run until killed externally
+    for (int i = 0; i < nthreads; ++i) {
+        workers[i].join();
+    }
+
     return 0;
 }

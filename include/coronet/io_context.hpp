@@ -45,7 +45,7 @@ namespace coronet {
 ///
 /// The core event loop / scheduler — single-threaded, one per io_context.
 /// No virtual dispatch, no heap allocation for the proactor.
-class [[nodiscard]] io_context final {
+class io_context final {
 public:
     // 编译期平台 Proactor 类型选择 / Compile-time proactor type selection
 #if defined(CORONET_PLATFORM_WINDOWS)

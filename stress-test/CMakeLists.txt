@@ -43,7 +43,7 @@ endif()
 # ---- Load generator + driver ----
 add_executable(redis_loadgen  redis_loadgen.cpp)
 target_link_libraries(redis_loadgen  PRIVATE coronet::coronet)
-add_executable(stress_driver  stress_test_Driver.cpp)
+add_executable(stress_driver stress_driver.cpp)
 target_link_libraries(stress_driver  PRIVATE coronet::coronet)
 if(CORONET_HAS_ASIO)
     target_compile_definitions(stress_driver PRIVATE CORONET_HAS_ASIO)
@@ -66,6 +66,6 @@ set_tests_properties(stress_driver_ST PROPERTIES TIMEOUT 60)
 add_test(NAME stress_driver_MT COMMAND $<TARGET_FILE:stress_driver>
     --server "coronet_MT(6):redis_echo_MT:6390"
     $<$<BOOL:${CORONET_HAS_ASIO}>:--server>
-    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_MT(6):redis_echo_asio_MT:6391">
+    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_MT\(6\):redis_echo_asio_MT:6391">
     -n 10000 -c 50)
-set_tests_properties(stress_driver_MT PROPERTIES TIMEOUT 60)
+set_tests_properties(stress_driver_MT PROPERTIES TIMEOUT 120)

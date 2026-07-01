@@ -4,6 +4,7 @@ build-release/
 build-*/
 cmake-build-*/
 build/
+build*/
 
 # IDE
 .idea/
@@ -20,6 +21,7 @@ build/
 *.so
 *.a
 *.dylib
+
 
 # CMake
 CMakeUserPresets.json

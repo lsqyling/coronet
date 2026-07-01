@@ -30,7 +30,7 @@ task<> run_and_stop(io_context& ctx) {
     auto [idx, var] = co_await any(f0(), f1(), f2());
     // f1 立即完成，应为胜者 / f1 completes immediately, should win
     assert(idx == 1);
-    printf("get the result of f%zu: ", idx);
+    printf("get the result of f%u: ", idx);
     std::visit(
         overload{
             [](std::monostate) { printf("(void)\n"); },

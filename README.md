@@ -51,25 +51,25 @@
 # 克隆
 git clone https://github.com/lsqyling/coronet.git && cd coronet
 
-# Linux — 默认 epoll 后端
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DCORONET_BUILD_TESTS=ON -DCORONET_BUILD_BENCHMARKS=ON
+# Linux — 默认 epoll 后端(Release)
+cmake -S . -B build -G Ninja
+    
 cmake --build build
 cd build && ctest --output-on-failure
 
 # 切换到 io_uring
 cmake -S . -B build-uring -G Ninja -DCORONET_IOURING=ON
 cmake --build build-uring
+ctest --test-dir build-uring --output-on-failure
 
 # Windows MSVC (Developer Command Prompt)
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
-ctest -C Release --output-on-failure
+ctest --test-dir build -C Release --output-on-failure
 
 # Install coronet
-cmake --install buildmsvc --prefix D:/dev/local # windows msvc 
-cmake --install buildgcc --prefix /usr/local    # linux gcc
-cmake --install buildclang --prefix /usr/local  # linux clang
+cmake --install build --prefix D:/dev/local # windows msvc 
+cmake --install build --prefix /usr/local    # linux 
 
 # how to use
 find_package(coronet REQUIRED)
