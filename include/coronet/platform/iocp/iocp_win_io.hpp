@@ -23,28 +23,33 @@
 namespace coronet::detail {
 
 // ============================================================
-// Base awaiter for IOCP I/O
+// Base awaiter for IOCP I/O — CRTP 编译期多态
 // ============================================================
-// IOCP awaiter 基类
+// IOCP awaiter 基类（CRTP 版本）
 //
 // 与 io_uring 不同，Windows IOCP 的 I/O 提交和完成是分开的：
-//   - 提交：在 await_suspend 中通过 issue_io() 虚函数调用实际的 Windows I/O API
+//   - 提交：在 await_suspend 中通过 CRTP 调用派生类的 issue_io() 发起 Windows I/O API
 //   - 完成：内核自动将完成事件投递到 IOCP，wait_completion 从中取出
 //
+// CRTP vs 虚函数：
+//   旧版使用虚函数 issue_io() 让派生类实现具体的 I/O 调用方式。
+//   新版使用 CRTP（奇异递归模板模式），在编译期将调用分派到派生类型，
+//   消除了 vtable 间接调用开销，使 issue_io() 可以被编译器内联。
+//   参考 epoll_lazy_io.hpp 中 epoll_awaiter_base<Derived> 的设计。
+//
 // 关键设计：
-//   1. win_awaiter 使用虚函数 issue_io() 让派生类实现具体的 I/O 调用方式。
-//      虽然虚函数有少量开销，但相对于 I/O 操作的延迟来说微不足道。
-//   2. 通过 finish_issue() 统一处理 I/O 提交结果：根据返回值区分同步完成和异步等待。
-//   3. 每个派生类在析构/完成时通过 recycle_operation() 回收 iocp_operation，
+//   1. 通过 finish_issue() 统一处理 I/O 提交结果：根据返回值区分同步完成和异步等待。
+//   2. 每个派生类在析构/完成时通过 recycle_operation() 回收 iocp_operation，
 //      避免每次 I/O 的堆分配开销。
-//   4. work_started()/work_finished() 跟踪飞行中操作，确保事件循环不会在所有操作完成前退出。
+//   3. work_started()/work_finished() 跟踪飞行中操作，确保事件循环不会在所有操作完成前退出。
 //
 // I/O 提交协议（finish_issue 中的判断逻辑）：
 //   - ioresult == 0：同步完成，WSAGetLastError() == NO_ERROR，调用 on_pending
 //   - ioresult != 0 && WSAGetLastError() == WSA_IO_PENDING：异步等待，调用 on_pending
 //   - ioresult != 0 && WSAGetLastError() != WSA_IO_PENDING：同步失败，直接 post 错误结果
 
-class win_awaiter {
+template<typename Derived>
+class win_awaiter_base {
 public:
     [[nodiscard]] int32_t result() const noexcept { return io_info_.result; }
     static constexpr bool await_ready() noexcept { return false; }
@@ -55,8 +60,9 @@ public:
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
         p->work_started();
-        // 调用派生类的 issue_io() 执行实际的 I/O 操作
-        issue_io();
+        // 通过 CRTP 调用派生类的 issue_io() 执行实际的 I/O 操作
+        // 编译器可内联此调用，因为派生类型在编译期已知
+        static_cast<Derived*>(this)->issue_io();
     }
 
     [[nodiscard]] int32_t await_resume() const noexcept { return result(); }
@@ -68,11 +74,11 @@ public:
 
     // Public for chained co_await
     // 公开给 chained_awaiter（operator&&）使用
-    void do_issue_io() noexcept { issue_io(); }
+    void do_issue_io() noexcept { static_cast<Derived*>(this)->issue_io(); }
     void refresh_user_data() noexcept { op_->set_user_data(io_info_.as_user_data()); }
 
 protected:
-    win_awaiter() noexcept {
+    win_awaiter_base() noexcept {
         // 从 proactor 获取（或回收复用）一个 iocp_operation
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
@@ -80,8 +86,9 @@ protected:
         if (op_) op_->set_user_data(io_info_.as_user_data());
     }
 
-    // 虚函数：派生类实现具体的 I/O 调用（WSARecv/WSASend/AcceptEx/...）
-    virtual void issue_io() noexcept = 0;
+    // 注意：不再有纯虚函数 issue_io()。
+    // 派生类提供 issue_io() 方法，通过 CRTP 在编译期分派。
+    // 如果派生类忘记实现，在链接时会得到"未定义引用"错误。
 
     void finish_issue(DWORD ioresult, DWORD /*bytes*/) noexcept {
         // 完成 I/O 提交的统一处理：
@@ -126,7 +133,7 @@ public:
 //   AcceptEx 的特点：
 //     - 支持接受连接的同时读取第一个数据包（减少一次 context switch）
 //     - 需要在调用前预先创建 accept socket
-//     - 需要提供两个地址缓冲区（本地地址 + 远程地址），大小必须至少为 sizeof(sockaddr_storage) + 16
+//     - 需要提供两个地址缓冲区（本地地址 + 远程地址），大小至少必须为 sizeof(sockaddr_storage) + 16
 //     - 连接接受后需要调用 setsockopt(SO_UPDATE_ACCEPT_CONTEXT) 使新 socket 继承监听 socket 的属性
 //
 //   ConnectEx 的特点：
@@ -178,16 +185,18 @@ inline LPFN_CONNECTEX get_connect_ex() noexcept {
 } // anonymous namespace
 
 // ============================================================
-// Concrete I/O operations
+// Concrete I/O operations — CRTP 派生类型
 // ============================================================
 // 具体的 I/O 操作实现
+// 每个类型继承 win_awaiter_base<自身>，实现 issue_io() 方法。
+// 不再使用 override 关键字（CRTP 编译期分派，非虚函数覆盖）。
 
-struct win_recv final : win_awaiter {
+struct win_recv final : win_awaiter_base<win_recv> {
     win_recv(uintptr_t sock, std::span<char> buf, int flags = 0) noexcept
-        : win_awaiter() { sock_ = sock; buf_ = buf; flags_ = flags; }
+        : win_awaiter_base() { sock_ = sock; buf_ = buf; flags_ = flags; }
 
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         // WSARecv 是 Windows 的异步 socket 接收 API。
         // WSABUF 是 Windows 的 scatter/gather I/O 缓冲区描述符。
         WSABUF wbuf{.len = static_cast<ULONG>(buf_.size()), .buf = buf_.data()};
@@ -200,9 +209,9 @@ private:
     int flags_ = 0;
 };
 
-struct win_send final : win_awaiter {
+struct win_send final : win_awaiter_base<win_send> {
     win_send(uintptr_t sock, std::span<const char> buf, int flags = 0) noexcept
-        : win_awaiter() {
+        : win_awaiter_base() {
         sock_ = sock;
         wbuf_ = WSABUF{.len = static_cast<ULONG>(buf.size()),
                         .buf = const_cast<char*>(buf.data())};
@@ -210,7 +219,7 @@ struct win_send final : win_awaiter {
     }
 
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         // WSASend 是 Windows 的异步 socket 发送 API。
         DWORD bytes = 0;
         int ret = ::WSASend((SOCKET)sock_, &wbuf_, 1, &bytes, flags_,
@@ -221,10 +230,10 @@ private:
     int flags_ = 0;
 };
 
-struct win_accept final : win_awaiter {
+struct win_accept final : win_awaiter_base<win_accept> {
     win_accept(uintptr_t sock, struct sockaddr* addr = nullptr,
                socklen_t* addrlen = nullptr, int flags = 0) noexcept
-        : win_awaiter() {
+        : win_awaiter_base() {
         sock_ = sock; addr_ = addr; addrlen_ = addrlen; (void)flags;
         create_accept_socket();
     }
@@ -249,7 +258,7 @@ private:
         }
     }
 
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         LPFN_ACCEPTEX fn = get_accept_ex();
         if (!fn || accept_socket_ == INVALID_SOCKET) {
             accept_socket_ = INVALID_SOCKET;
@@ -308,13 +317,13 @@ private:
     char addr_buf_[sizeof(sockaddr_storage) * 2 + 32]{};
 };
 
-struct win_connect final : win_awaiter {
+struct win_connect final : win_awaiter_base<win_connect> {
     win_connect(uintptr_t sock, const struct sockaddr* addr,
                 socklen_t addrlen) noexcept
-        : win_awaiter() { sock_ = sock; addr_ = addr; addrlen_ = addrlen; }
+        : win_awaiter_base() { sock_ = sock; addr_ = addr; addrlen_ = addrlen; }
 
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         LPFN_CONNECTEX fn = get_connect_ex();
         if (!fn) { io_info_.result = -1; finish_issue(1, 0); return; }
 
@@ -353,10 +362,10 @@ private:
     socklen_t addrlen_ = 0;
 };
 
-struct win_close final : win_awaiter {
-    explicit win_close(uintptr_t sock) noexcept : win_awaiter() { sock_ = sock; }
+struct win_close final : win_awaiter_base<win_close> {
+    explicit win_close(uintptr_t sock) noexcept : win_awaiter_base() { sock_ = sock; }
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         // closesocket 是同步操作，没有重叠 I/O 版本。
         // 执行完后通过 on_sync_completion 手动 post 完成事件到 IOCP。
         ::closesocket((SOCKET)sock_);
@@ -370,10 +379,10 @@ private:
     }
 };
 
-struct win_nop final : win_awaiter {
-    win_nop() noexcept : win_awaiter() {}
+struct win_nop final : win_awaiter_base<win_nop> {
+    win_nop() noexcept : win_awaiter_base() {}
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         // NOP（空操作）：立即成功，通过 on_sync_completion 手动 post 完成事件
         io_info_.result = 0;
         // Post completion manually — nop is synchronous, not overlapped
@@ -396,16 +405,16 @@ private:
 //   IOCP 本身不直接支持超时。唯一的方案是启动一个后台线程调用 Sleep()，
 //   然后通过 PostQueuedCompletionStatus 或 on_sync_completion 通知完成。
 //   这虽然有一个线程创建的开销，但对于定时器操作来说可以接受。
-struct win_timeout final : win_awaiter {
+struct win_timeout final : win_awaiter_base<win_timeout> {
     template<typename Rep, typename Period>
     explicit win_timeout(const std::chrono::duration<Rep, Period>& dur) noexcept
-        : win_awaiter() {
+        : win_awaiter_base() {
         dur_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(dur).count();
         if (dur_ms_ < 1) dur_ms_ = 1;
     }
 
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         auto* raw_op = op_.release();        // transfer ownership to background thread
         // 通过 release 转移 ownership 到后台线程
         auto* proactor = static_cast<platform::iocp::iocp_proactor*>(
@@ -433,11 +442,11 @@ private:
 //
 //   使用后台线程 + _read + IOCP 完成回调的模式：
 //   后台线程执行阻塞的 _read，完成后通过 on_sync_completion 通知原始线程。
-struct win_read final : win_awaiter {
+struct win_read final : win_awaiter_base<win_read> {
     win_read(int fd, std::span<char> buf, uint64_t /*offset*/) noexcept
-        : win_awaiter() { fd_ = fd; buf_ = buf; }
+        : win_awaiter_base() { fd_ = fd; buf_ = buf; }
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         auto* raw_op = op_.release();
         auto* proactor = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
@@ -453,11 +462,11 @@ private:
 
 /// Windows async write (file/pipe/console): uses background thread + _write + IOCP.
 // Windows 异步写（文件/管道/控制台）：使用后台线程 + _write + IOCP。
-struct win_write final : win_awaiter {
+struct win_write final : win_awaiter_base<win_write> {
     win_write(int fd, std::span<const char> buf, uint64_t /*offset*/) noexcept
-        : win_awaiter() { fd_ = fd; buf_ = buf; }
+        : win_awaiter_base() { fd_ = fd; buf_ = buf; }
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         auto* raw_op = op_.release();
         auto* proactor = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
@@ -471,12 +480,12 @@ private:
     std::span<const char> buf_;
 };
 
-struct win_shutdown final : win_awaiter {
-    win_shutdown(uintptr_t sock, int how) noexcept : win_awaiter() {
+struct win_shutdown final : win_awaiter_base<win_shutdown> {
+    win_shutdown(uintptr_t sock, int how) noexcept : win_awaiter_base() {
         sock_ = sock; how_ = how;
     }
 private:
-    void issue_io() noexcept override {
+    void issue_io() noexcept {
         // shutdown 是同步操作，没有重叠 I/O 版本。
         // 与 closesocket 一样，通过 on_sync_completion 手动 post 完成事件。
         int ret = ::shutdown((SOCKET)sock_, how_);

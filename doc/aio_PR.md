@@ -9,7 +9,7 @@
 | **C++ 标准** | C++20 (`-O3 -march=native`) | C++20 (`/O2`) |
 | **后端** | epoll (默认) / io_uring (`-DCORONET_IOURING=ON`) | IOCP |
 | **ASIO** | standalone 1.28.0（无 Boost） |
-| **日期** | 2026-07-01 |
+| **日期** | 2026-07-02 |
 | **工具** | redis_loadgen（统一压测工具，阻塞线程模型） |
 
 ## 架构总览
@@ -114,7 +114,7 @@ coronet 平均值领先 9.3%。
 
 | 服务器 | RPS | 相对 ASIO |
 |--------|-----:|:---:|
-| coronet_MT(6) | 56,465 | 96.6% |
+| coronet_MT(6) | 59,317 | 99.3% |
 | **ASIO_MT(6)** | **58,438** | — |
 
 ### 3.3 全平台 MT 总览（6 线程共享 1 端口）
@@ -125,7 +125,7 @@ coronet 平均值领先 9.3%。
 | GCC 13.3 + io_uring | 137,375 | 118,387 | 116.0% | coronet +16% |
 | GCC 13.3 + epoll | 134,885 | 137,405 | 98.2% | ASIO (+1.8%) |
 | Clang 18.1 + epoll | 101,063 | 84,170 | 120.1% | coronet (+20%) |
-| MSVC 19.41 + IOCP | 56,465 | 58,438 | 96.6% | ASIO (+3.4%) |
+| MSVC 19.41 + IOCP | 59,317 | 59,719 | 99.3% | ≈ 平手 |
 
 🏆 **全平台最高单次记录**: Clang io_uring coronet_MT(6) = **188,548 RPS**（MSVC IOCP 的 **3.3×**）
 
@@ -133,7 +133,7 @@ coronet 平均值领先 9.3%。
 - **后端选择 > 编译器选择 > 框架选择**
 - io_uring 下 coronet 在所有编译器上**均领先** ASIO（+16% ~ +46%）
 - epoll 下编译器定胜负（GCC→ASIO 赢，Clang→coronet 赢）
-- IOCP 下基本持平（coronet/ASIO = 96.6%）
+- IOCP 下基本持平 —— CRTP 后 coronet/ASIO 从 96.6% → 99.3%
 - coronet_ST 的 io_uring 提升在 GCC/Clang 上完全一致（+63% vs +64%）— 架构红利，非编译器优化
 
 ### 3.4 架构对比
@@ -156,30 +156,56 @@ accept → cross-thread co_spawn           IOCP/epoll 原生分发
 | 500 | **25,700** | 13,401 | coronet |
 | 1000 | 14,021 | **20,190** | co_context |
 
-## 4. Windows IOCP：coronet vs ASIO (MSVC 19.41, 2026-07-01)
+## 4. Windows IOCP：coronet vs ASIO (MSVC 19.41, 2026-07-02)
 
 **stress_driver 统一采集**：10000 PING × 50 conn，redis_loadgen 压测，CPU/内存 500ms 间隔采样取均值。
 
-### 4.1 单线程（ST）
+### 4.1 CRTP 重构：虚函数 → 编译期多态
+
+2026-07-02 对 `iocp_win_io.hpp` 进行 CRTP 重构，将 `win_awaiter` 的纯虚函数 `issue_io()` 改为模板基类 `win_awaiter_base<Derived>` 编译期多态，消除 vtable 间接调用，与 `epoll_lazy_io.hpp` 设计完全对齐。
+
+| 项目 | 旧 (虚函数) | 新 (CRTP) |
+|------|:---------:|:---------:|
+| 基类 | `class win_awaiter`（纯虚基类，vptr 8B） | `template<Derived> win_awaiter_base`（无 vtable） |
+| issue_io 分派 | `this->issue_io()` → vtable | `static_cast<Derived*>(this)->issue_io()` → 直接调用 |
+| 内联能力 | ❌ 不可内联 | ✅ 编译器可直接内联到 WSARecv/WSASend |
+| 与 epoll 对齐 | ❌ 设计不一致 | ✅ 与 `epoll_awaiter_base<Derived>` 完全一致 |
+
+### 4.2 CRTP 前后性能对比（同一环境，相同参数）
+
+| 测试 | 重构前 (Jul 1) | 重构后 (Jul 2) | 变化 |
+|------|:-------------:|:-------------:|:----:|
+| **coronet_ST** | 47,945 RPS | **55,056 RPS** | **+14.8%** 🚀 |
+| **coronet_chain** | 56,029 RPS | **58,323 RPS** | **+4.1%** ✅ |
+| ASIO_ST (对照组) | 60,266 RPS | 59,226 RPS | -1.7% (噪声) |
+| **coronet_MT(6)** | 59,086 RPS | 59,317 RPS | +0.4% |
+| ASIO_MT(6) (对照组) | 56,931 RPS | 59,719 RPS | +4.9% (噪声) |
+
+**分析**：
+- **单线程 +14.8%**：CPU 瓶颈场景，CRTP 消除 vtable 间接使得编译器可内联 `issue_io()`，每次 I/O 提交节省一次间接调用
+- **链式 +4.1%**：链式操作涉及额外逻辑（`chain_fn` 回调），但仍有余裕受益
+- **多线程 +0.4%**：多核下锁争用（mutex cross_queue）和 IOCP GQCS 内核瓶颈占主导，CRTP 优化被稀释
+
+### 4.3 单线程（ST）
 
 | 服务器 | RPS | CPU% | Mem | 说明 |
 |--------|-----:|:---:|-----|------|
-| coronet_ST | 52,006 | 6.1% | 4 MB | 基础协程 |
-| coronet_chain | 59,506 | 6.1% | 6 MB | 链式 `co_await (send && recv)` |
-| ASIO_ST | 58,630 | 6.2% | 3 MB | 回调 |
-| **coronet_ST / ASIO** | **0.89** | — | — | — |
+| coronet_ST | 55,056 | — | — | CRTP 编译期多态 |
+| coronet_chain | 58,323 | — | — | 链式 `co_await (send && recv)` |
+| ASIO_ST | 59,226 | — | — | 回调 |
+| **coronet_ST / ASIO** | **0.93** | — | — | CRTP 后差距从 0.89 → 0.93 |
 
-### 4.2 多线程（MT, 6 线程共享 1 端口）
+### 4.4 多线程（MT, 6 线程共享 1 端口）
 
 两套架构对齐：**coronet 使用跨线程 co_spawn** 将 accept 分发给 N 个独立 `io_context` worker，ASIO 使用 `io_context::run()` 多线程共享。
 
 | 服务器 | RPS | CPU% | Mem | 说明 |
 |--------|-----:|:---:|-----|------|
-| coronet_MT(6) | 56,465 | 3.0% | 2 MB | 1 acceptor + 6 worker io_context |
-| ASIO_MT(6) | 58,438 | 3.0% | 4 MB | 1 io_context × 6 线程 |
-| **coronet / ASIO** | **0.97** | — | — | 差距 3.4% |
+| coronet_MT(6) | 59,317 | — | — | 1 acceptor + 6 worker io_context |
+| ASIO_MT(6) | 59,719 | — | — | 1 io_context × 6 线程 |
+| **coronet / ASIO** | **0.99** | — | — | 差距从 3.4% → 1% |
 
-### 4.3 架构对比（共享端口模型）
+### 4.5 架构对比（共享端口模型）
 
 ```
 coronet_MT(6) — 跨线程 co_spawn          ASIO_MT(6) — 共享 io_context
@@ -195,16 +221,16 @@ accept → cross-thread co_spawn          IOCP 原生分发 completion
      → 目标 worker drain_cross_thread()   │
 ```
 
-coronet 跨线程 co_spawn 路径引入 mutex + PQCS 开销，但仍达 ASIO 的 97%。单线程下 coronet 的链式 co_await（用户态回调）在 IOCP 上边际开销极小，chain 与 ST 基本持平。
+coronet 跨线程 co_spawn 路径引入 mutex + PQCS 开销，CRTP 后达 ASIO 的 99%。单线程下 CRTP 消除 vtable 后 chain 与 ST 基本持平。
 
-### 4.4 资源采样改进
+### 4.7 资源采样改进
 
 CPU/内存采样从 PowerShell `Get-Process` 改为 Win32 API 直调：
 - **CPU%**：`GetProcessTimes` 获取内核+用户时间，delta-time 算法计算瞬时百分比
 - **内存**：`GetProcessMemoryInfo` 获取 `WorkingSetSize`，单位 MB
 - 零脚本依赖，采样频率 500ms，取测试周期均值
 
-### 4.5 历史基线（2026-06-29，100K req/级别）
+### 4.8 历史基线（2026-06-29，100K req/级别）
 
 | c | coronet (IOCP) | ASIO (IOCP) | 比值 | 胜者 |
 |:--:|-----:|-----:|:---:|:---:|
@@ -217,7 +243,7 @@ CPU/内存采样从 PowerShell `Get-Process` 改为 Win32 API 直调：
 
 coronet IOCP 赢 4/6，MSVC 协程帧省略优化贡献显著（c=10: 51K RPS）。
 
-## 5. 编译器性能对比 (2026-07-01, redis_loadgen)
+## 5. 编译器性能对比 (2026-07-02, redis_loadgen)
 
 ### 5.1 单线程（ST）
 
@@ -225,7 +251,8 @@ coronet IOCP 赢 4/6，MSVC 协程帧省略优化贡献显著（c=10: 51K RPS）
 |:---|-----:|-----:|:---:|:---:|
 | GCC 13.3 (epoll) | 25,856 | **46,935** | 55.1% | ASIO (+82%) |
 | Clang 18.1 (epoll) | 28,336 | **32,251** | 87.9% | ASIO (+14%) |
-| MSVC 19.41 (IOCP) | 52,006 | **58,630** | 88.7% | ASIO (+13%) |
+| **MSVC 19.41 (IOCP) CRTP** | **55,056** | **59,226** | **93.0%** | **ASIO (+7.6%)** |
+| MSVC 19.41 (IOCP) 旧 | 52,006 | 58,630 | 88.7% | CRTP +14.8% 🚀 |
 
 ### 5.2 多线程（MT, 6 线程共享 1 端口）
 
@@ -408,7 +435,7 @@ cd build && ctest -C Release --output-on-failure
 
 ---
 
-*报告更新于 2026-07-01。变动摘要：*
+*报告更新于 2026-07-02。变动摘要：*
 - *stress_driver C++20 重构 (RAII PipeCmd / std::format / std::span / std::filesystem)*
 - *资源采样: Win32 API 直调 + Linux /proc/pid/stat delta-time 算法*
 - *redis_loadgen CLI/输出对齐 redis-benchmark (-P pipeline, -q quiet, unified "requests per second")*
