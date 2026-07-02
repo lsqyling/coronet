@@ -320,6 +320,10 @@ cmake -S . -B build -G Ninja -DCORONET_IOURING=ON
 
 # 启用全部测试
 cmake -S . -B build -DCORONET_BUILD_TESTS=ON -DCORONET_BUILD_BENCHMARKS=ON -DCORONET_BUILD_STRESS_TESTS=ON
+# or
+cmake -S . -B build -DCORONET_DEVELOPER_MODE=ON
+ctest --test-dir build --output-on-failure // linux
+ctest --test-dir build -C Release --output-on-failure // windows
 ```
 
 ## 7. 链式 co_await

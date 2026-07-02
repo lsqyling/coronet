@@ -247,7 +247,7 @@ coronet/
 │   ├── co/                #   mutex / cv / sem / channel
 │   ├── platform/          #   epoll / io_uring / IOCP
 │   └── detail/            #   内部实现
-├── lib/coronet/           # .cpp 实现
+├── src/coronet/           # .cpp 实现
 ├── test/                  # 21 项 CTest
 ├── bench/                 # Google Benchmark
 ├── stress-test/           # 压测驱动 + 服务端
