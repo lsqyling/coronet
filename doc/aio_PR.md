@@ -436,6 +436,7 @@ cd build && ctest -C Release --output-on-failure
 ---
 
 *报告更新于 2026-07-02。变动摘要：*
+- *`iocp_win_io.hpp` CRTP 重构：`win_awaiter` 虚函数 → `win_awaiter_base<Derived>` 编译期多态，消除 vtable 间接调用，单线程 RPS +14.8%，MT RPS +0.4%*
 - *stress_driver C++20 重构 (RAII PipeCmd / std::format / std::span / std::filesystem)*
 - *资源采样: Win32 API 直调 + Linux /proc/pid/stat delta-time 算法*
 - *redis_loadgen CLI/输出对齐 redis-benchmark (-P pipeline, -q quiet, unified "requests per second")*
