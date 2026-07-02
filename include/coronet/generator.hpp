@@ -3,6 +3,29 @@
 // Authors: Casey Carter, Lewis Baker, Corentin Jabot.
 // https://godbolt.org/z/5hcaPcfvP
 //
+/*
+ * std::generator 提案 P2502R2 的参考实现。
+ *
+ * generator 是一个协程返回类型，产生一系列值（类似 Python 的 yield 或
+ * C# 的 IEnumerable），支持按需惰性求值（lazy evaluation）。
+ *
+ * 为什么在异步 I/O 库中包含 generator：
+ * - generator 本身是同步的，但它与协程机制共享相同的底层基础设施
+ *   （promise_type、awaitable、coroutine_handle 等）
+ * - 在异步编程中，generator 可用于"流式处理"：将一个 I/O 操作的
+ *   多次结果以同步风格逐个产生，上层以 for-range 循环消费
+ * - 例如：逐行读取文件、分批处理网络数据等
+ * - 这是 C++23 标准库的一部分，提供参考实现以便测试和过渡
+ *
+ * 与 task<T> 的区别：
+ * - task<T> 产生一个最终值，generator<T> 产生一个值序列
+ * - task<T> 是 eager（在 co_await 时执行），generator 是 lazy
+ *   （在 begin()/operator++ 时推进）
+ * - task<T> 有 unique ownership，generator 允许多次迭代
+ *
+ * 本文件是提案的标准参考实现，略有调整以适配 coronet 的命名空间。
+ * 一些变量名（如 _Val、_Ptr、_Coro）遵循 MSVC STL 的内部命名风格。
+ */
 #ifndef CORONET_GENERATOR_HPP
 #define CORONET_GENERATOR_HPP
 
@@ -17,6 +40,14 @@
 #include <type_traits>
 #include <utility>
 
+/*
+ * 平台相关的宏定义：
+ * - EMPTY_BASES（MSVC __declspec(empty_bases)）：优化空基类的布局，
+ *     使空基类不占用额外空间，这是 MSVC 的 COM 兼容性需求。
+ * - NO_UNIQUE_ADDRESS：在 MSVC 上用 [[msvc::no_unique_address]]，
+ *     在 Clang/GCC 上用标准 [[no_unique_address]]。
+ *     因为 MSVC 的 [[no_unique_address]] 实现不完整。
+ */
 #ifdef _MSC_VER
 #define EMPTY_BASES __declspec(empty_bases)
 #ifdef __clang__
@@ -32,6 +63,10 @@
 // NOLINTBEGIN
 namespace coronet {
 
+/*
+ * _Aligned_block：按 STPCPP_DEFAULT_NEW_ALIGNMENT（通常是 16）对齐的块。
+ * 供分配器使用，确保协程帧对齐到默认对齐要求。
+ */
 struct alignas(__STDCPP_DEFAULT_NEW_ALIGNMENT__) _Aligned_block {
     unsigned char _Pad[__STDCPP_DEFAULT_NEW_ALIGNMENT__];
 };
@@ -40,11 +75,42 @@ template<class _Alloc>
 using _Rebind = typename std::allocator_traits<_Alloc>::template rebind_alloc<
     _Aligned_block>;
 
+/*
+ * _Has_real_pointers：检查分配器是否使用真实指针。
+ * 协程帧的分配需要真实的连续内存，不能使用 fancy pointer（如偏移量指针）。
+ * 如果分配器是 void（使用默认的 operator new/delete），或者分配器的
+ * pointer 类型是原生指针，则满足要求。
+ */
 template<class _Alloc>
 concept _Has_real_pointers =
     std::same_as<_Alloc, void>
     || std::is_pointer_v<typename std::allocator_traits<_Alloc>::pointer>;
 
+/*
+ * _Promise_allocator：协程 promise 的分配器管理。
+ *
+ * 协程帧的内存分配是通过 promise_type 的 operator new 完成的。
+ * 标准协程支持通过 std::allocator_arg 传递自定义分配器，但分配器的
+ * 生命周期管理比较复杂：
+ *
+ * 分配器分类：
+ * 1. 无状态分配器（is_always_equal）：不需要存储，在 operator delete 中
+ *    重新构造一个即可。
+ * 2. 有状态分配器：必须在协程帧中存储一份拷贝，以便在销毁时使用正确
+ *    的分配器释放内存。
+ *
+ * 类型擦除版本（_Promise_allocator<void>）：
+ * - 当分配器类型在编译期未知时使用（例如通过模板推导）。
+ * - 使用函数指针 _Dealloc_fn 存储释放逻辑。
+ * - 分配器数据嵌入在协程帧的尾部，operator new 会分配额外空间来存储。
+ * - 这种设计增加了每次分配的开销（额外的函数指针调用），但提供了
+ *   最大的灵活性。
+ *
+ * 为什么不在 _Promise_allocator<void> 中使用 std::function：
+ * - std::function 可能涉及堆分配，在协程帧分配器内部使用堆分配
+ *   会导致循环依赖。
+ * - 裸函数指针 + memcpy 是最轻量的类型擦除方案。
+ */
 template<class _Allocator = void>
 class _Promise_allocator { // statically specified allocator type
   private:
@@ -53,11 +119,13 @@ class _Promise_allocator { // statically specified allocator type
     static void *_Allocate(_Alloc _Al, const size_t _Size) {
         if constexpr (std::default_initializable<_Alloc> && std::allocator_traits<_Alloc>::is_always_equal::value) {
             // do not store stateless allocator
+            // 不存储无状态分配器
             const size_t _Count =
                 (_Size + sizeof(_Aligned_block) - 1) / sizeof(_Aligned_block);
             return _Al.allocate(_Count);
         } else {
             // store stateful allocator
+            // 存储有状态分配器
             static constexpr size_t _Align =
                 (::std::max)(alignof(_Alloc), sizeof(_Aligned_block));
             const size_t _Count =
@@ -109,12 +177,14 @@ class _Promise_allocator { // statically specified allocator type
     static void operator delete(void *const _Ptr, const size_t _Size) noexcept {
         if constexpr (std::default_initializable<_Alloc> && std::allocator_traits<_Alloc>::is_always_equal::value) {
             // make stateless allocator
+            // 重新构造无状态分配器
             _Alloc _Al{};
             const size_t _Count =
                 (_Size + sizeof(_Aligned_block) - 1) / sizeof(_Aligned_block);
             _Al.deallocate(static_cast<_Aligned_block *>(_Ptr), _Count);
         } else {
             // retrieve stateful allocator
+            // 取回存储的有状态分配器
             const auto _Al_address = (reinterpret_cast<uintptr_t>(_Ptr) + _Size
                                       + alignof(_Alloc) - 1)
                                      & ~(alignof(_Alloc) - 1);
@@ -131,6 +201,21 @@ class _Promise_allocator { // statically specified allocator type
     }
 };
 
+/*
+ * _Promise_allocator<void> 特化：类型擦除的分配器管理。
+ *
+ * 当分配器类型在编译期未知时使用。通过在协程帧尾部存储
+ * 一个函数指针（_Dealloc_fn）和（可选的）分配器实例来实现类型擦除。
+ *
+ * 内存布局（无状态分配器）：
+ *   [协程帧数据] [_Dealloc_fn]
+ *
+ * 内存布局（有状态分配器）：
+ *   [协程帧数据] [_Dealloc_fn] [_Alloc 实例]
+ *
+ * _Dealloc_fn 在分配时被 memcpy 存入，在释放时被取出调用。
+ * 这避免了虚函数表或 std::function 的开销。
+ */
 template<>
 class _Promise_allocator<void> { // type-erased allocator
   private:
@@ -143,6 +228,7 @@ class _Promise_allocator<void> { // type-erased allocator
 
         if constexpr (std::default_initializable<_Alloc> && std::allocator_traits<_Alloc>::is_always_equal::value) {
             // don't store stateless allocator
+            // 不存储无状态分配器
             const _Dealloc_fn _Dealloc = [](void *const _Ptr,
                                             const size_t _Size) {
                 _Alloc _Al{};
@@ -162,6 +248,7 @@ class _Promise_allocator<void> { // type-erased allocator
             return _Ptr;
         } else {
             // store stateful allocator
+            // 存储有状态分配器
             static constexpr size_t _Align =
                 (::std::max)(alignof(_Alloc), sizeof(_Aligned_block));
 
@@ -254,6 +341,20 @@ class _Promise_allocator<void> { // type-erased allocator
 };
 
 namespace ranges {
+    /*
+     * elements_of：generator 的嵌套 yield（yield 另一个 range 的所有元素）。
+     *
+     * 使用方式：
+     *   generator<int> inner() { co_yield 1; co_yield 2; }
+     *   generator<int> outer() {
+     *       co_yield elements_of(inner());
+     *       co_yield elements_of(std::vector{3, 4});
+     *   }
+     *   // 结果：1, 2, 3, 4
+     *
+     * 这类似于 Python 的 yield from 语法。
+     * _Rng 可以是 generator、容器或任何 input_range。
+     */
     template<std::ranges::range _Rng, class _Alloc = std::allocator<std::byte>>
     struct elements_of {
         NO_UNIQUE_ADDRESS _Rng range;
@@ -264,6 +365,13 @@ namespace ranges {
     elements_of(_Rng &&, _Alloc = {}) -> elements_of<_Rng &&, _Alloc>;
 } // namespace ranges
 
+/*
+ * generator 主模板的前置声明。
+ * 三个模板参数：
+ * - _Rty：引用类型（决定迭代器解引用的返回类型）
+ * - _Vty：值类型（决定 value_type，默认为 void 时使用 remove_cvref<_Rty>）
+ * - _Alloc：协程帧分配器（默认为 void，使用全局 operator new/delete）
+ */
 template<class _Rty, class _Vty = void, class _Alloc = void>
 class generator;
 
@@ -277,6 +385,26 @@ template<class _Ref>
 using _Gen_yield_t =
     std::conditional_t<std::is_reference_v<_Ref>, _Ref, const _Ref &>;
 
+/*
+ * _Gen_promise_base：generator 协程的 promise 基础类。
+ *
+ * 这是 generator 的核心状态管理类，处理：
+ * - yield_value：将产生的值暴露给迭代器
+ * - 嵌套 generator 的展开（elements_of 支持）
+ * - 协程的初始/最终挂起逻辑
+ * - 异常传播
+ *
+ * 嵌套 generator（yield_value for elements_of<generator>）：
+ * 通过 _Nested_awaitable 实现递归展开。当 generator A 产生
+ * elements_of(generator B) 时，A 挂起自己，B 开始执行产生值，
+ * 迭代器透明地遍历 B 的所有值后将控制权返回给 A。
+ *
+ * _Final_awaiter 的设计：
+ * 当协程执行完所有 yield 语句并正常结束时，final_suspend 被调用。
+ * 它检查 _Info 判断当前是否在嵌套展开中：
+ * - 如果是：恢复父协程（让外层 generator 继续 yield 自己的值）
+ * - 如果不是：返回 noop_coroutine（表示迭代结束）
+ */
 template<class _Yielded>
 class _Gen_promise_base {
   public:
@@ -361,6 +489,11 @@ class _Gen_promise_base {
     }
 
   private:
+    /*
+     * _Element_awaiter：用于支持 yield_value 的值传递重载。
+     * 当 _Yielded 是右值引用时，值需要被移动/复制到 awaiter 中。
+     * await_suspend 时将地址存入 _Ptr。
+     */
     struct _Element_awaiter {
         std::remove_cvref_t<_Yielded> _Val;
 
@@ -384,12 +517,28 @@ class _Gen_promise_base {
         constexpr void await_resume() const noexcept {}
     };
 
+    /*
+     * _Nest_info：嵌套 generator 展开时的上下文信息。
+     * - _Except：嵌套 generator 抛出的异常
+     * - _Parent：外层 generator 的协程句柄
+     * - _Root：最外层 generator 的协程句柄
+     *   多个嵌套层次共用一个 _Root，用于 _Top 指针的快速访问
+     */
     struct _Nest_info {
         std::exception_ptr _Except;
         std::coroutine_handle<_Gen_promise_base> _Parent;
         std::coroutine_handle<_Gen_promise_base> _Root;
     };
 
+    /*
+     * _Final_awaiter：协程最终的挂起等待器。
+     *
+     * await_suspend 逻辑：
+     * 1. 如果 _Info 为空（没有嵌套），返回 noop_coroutine —— 迭代结束
+     * 2. 如果有嵌套，获取父协程句柄 _Parent，恢复父协程以继续外层迭代
+     * 3. 在恢复前更新最外层 generator 的 _Top 为当前嵌套的父节点，
+     *    以确保 _Top 指针链的正确性
+     */
     struct _Final_awaiter {
         [[nodiscard]]
         bool await_ready() noexcept {
@@ -420,6 +569,22 @@ class _Gen_promise_base {
         void await_resume() noexcept {}
     };
 
+    /*
+     * _Nested_awaitable：嵌套 generator 的等待器。
+     *
+     * 当 generator A 执行 co_yield elements_of(gen_B) 时：
+     * 1. yield_value 创建一个 _Nested_awaitable，持有 gen_B 的拷贝
+     * 2. 协程 A 的 await_suspend 保存 A 的上下文到 _Nested 中
+     * 3. 返回 gen_B 的协程句柄，执行转移到 gen_B
+     * 4. 迭代器通过 gen_B 产生值，直到 gen_B 结束
+     * 5. gen_B 的 final_suspend 恢复 A
+     * 6. A 的 await_resume 检查 gen_B 是否有异常
+     *
+     * _Top 指针链：
+     * 最外层 generator 的 promise 持有 _Top，指向当前正在产生值的
+     * generator 的 promise。迭代器通过 _Top.promise()._Ptr 获取当前值。
+     * 这避免了在嵌套展开时多次解引用句柄链。
+     */
     template<class _Rty, class _Vty, class _Alloc>
     struct _Nested_awaitable {
         static_assert(std::same_as<
@@ -476,14 +641,28 @@ class _Gen_promise_base {
     friend class _Gen_iter;
 
     // _Top and _Info are mutually exclusive, and could potentially be merged.
+    // _Top 和 _Info 互斥：有嵌套时用 _Info，无嵌套时用 _Top 指向自己
     std::coroutine_handle<_Gen_promise_base> _Top =
         std::coroutine_handle<_Gen_promise_base>::from_promise(*this);
     std::add_pointer_t<_Yielded> _Ptr = nullptr;
     _Nest_info *_Info = nullptr;
 };
 
+/*
+ * _Gen_secret_tag：用于控制 generator 和 _Gen_iter 构造函数的访问权限。
+ * 只有 friend 类和函数可以创建带有此 tag 的对象，防止用户错误地构造它们。
+ */
 struct _Gen_secret_tag {};
 
+/*
+ * _Gen_iter：generator 的迭代器。
+ *
+ * 迭代器使用 _Top 指针间接获取当前值，这是因为在嵌套 generator 的场景中，
+ * 当前产生值的协程可能不是最外层的 generator。
+ *
+ * operator++ 会恢复 _Top 所指向的协程，推进 generator 到下一个 yield 点。
+ * 当 _Top 协程 done() 时，迭代器等于 end()。
+ */
 template<class _Value, class _Ref>
 class _Gen_iter {
   public:
@@ -532,6 +711,28 @@ class _Gen_iter {
     std::coroutine_handle<_Gen_promise_base<_Gen_yield_t<_Ref>>> _Coro;
 };
 
+/*
+ * generator 类 —— 协程的返回类型，产生值序列。
+ *
+ * 使用方式：
+ *   generator<int> range(int n) {
+ *       for (int i = 0; i < n; ++i) co_yield i;
+ *   }
+ *   for (int x : range(5)) { /* 0, 1, 2, 3, 4 * / }
+ *
+ * promise_type 的继承链：
+ *   promise_type : _Promise_allocator<_Alloc>, _Gen_promise_base<_Yielded>
+ *   - _Promise_allocator 管理协程帧的内存分配
+ *   - _Gen_promise_base 管理协程生命周期和值产生逻辑
+ *
+ * 使用 __declspec(empty_bases)（MSVC）确保两个基类中空的类不占用额外空间。
+ * std::is_pointer_interconvertible_base_of 检查确保两个基类可以安全地
+ * 在指针之间转换（这是静态转换而非 dynamic_cast 的前提）。
+ *
+ * generator 是 move-only 类型（复制构造函数被删除），
+ * 因为协程句柄是独占资源。
+ * 移动后将源对象置空（通过 std::exchange），防止 double destroy。
+ */
 template<class _Rty, class _Vty, class _Alloc>
 class generator
     : public std::ranges::view_interface<generator<_Rty, _Vty, _Alloc>> {
@@ -601,6 +802,7 @@ class generator
     [[nodiscard]]
     _Gen_iter<_Value, _Ref> begin() {
         // Pre: _Coro is suspended at its initial suspend point
+        // 前提：_Coro 在初始挂起点已挂起
         assert(_Coro && "Can't call begin on moved-from generator");
         _Coro.resume();
         return _Gen_iter<_Value, _Ref>{

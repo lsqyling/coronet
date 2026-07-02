@@ -27,7 +27,7 @@ include(cmake/Install.cmake)        # Install rules
 # ============================================================
 # Library sources
 # ============================================================
-add_subdirectory(lib)
+add_subdirectory(src)
 
 # ============================================================
 # Package config (optional)

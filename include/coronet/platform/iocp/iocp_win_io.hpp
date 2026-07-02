@@ -25,6 +25,24 @@ namespace coronet::detail {
 // ============================================================
 // Base awaiter for IOCP I/O
 // ============================================================
+// IOCP awaiter 基类
+//
+// 与 io_uring 不同，Windows IOCP 的 I/O 提交和完成是分开的：
+//   - 提交：在 await_suspend 中通过 issue_io() 虚函数调用实际的 Windows I/O API
+//   - 完成：内核自动将完成事件投递到 IOCP，wait_completion 从中取出
+//
+// 关键设计：
+//   1. win_awaiter 使用虚函数 issue_io() 让派生类实现具体的 I/O 调用方式。
+//      虽然虚函数有少量开销，但相对于 I/O 操作的延迟来说微不足道。
+//   2. 通过 finish_issue() 统一处理 I/O 提交结果：根据返回值区分同步完成和异步等待。
+//   3. 每个派生类在析构/完成时通过 recycle_operation() 回收 iocp_operation，
+//      避免每次 I/O 的堆分配开销。
+//   4. work_started()/work_finished() 跟踪飞行中操作，确保事件循环不会在所有操作完成前退出。
+//
+// I/O 提交协议（finish_issue 中的判断逻辑）：
+//   - ioresult == 0：同步完成，WSAGetLastError() == NO_ERROR，调用 on_pending
+//   - ioresult != 0 && WSAGetLastError() == WSA_IO_PENDING：异步等待，调用 on_pending
+//   - ioresult != 0 && WSAGetLastError() != WSA_IO_PENDING：同步失败，直接 post 错误结果
 
 class win_awaiter {
 public:
@@ -37,6 +55,7 @@ public:
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
         p->work_started();
+        // 调用派生类的 issue_io() 执行实际的 I/O 操作
         issue_io();
     }
 
@@ -48,20 +67,27 @@ public:
     template<typename, typename> friend struct chained_awaiter;
 
     // Public for chained co_await
+    // 公开给 chained_awaiter（operator&&）使用
     void do_issue_io() noexcept { issue_io(); }
     void refresh_user_data() noexcept { op_->set_user_data(io_info_.as_user_data()); }
 
 protected:
     win_awaiter() noexcept {
+        // 从 proactor 获取（或回收复用）一个 iocp_operation
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
         op_ = p->acquire_operation();
         if (op_) op_->set_user_data(io_info_.as_user_data());
     }
 
+    // 虚函数：派生类实现具体的 I/O 调用（WSARecv/WSASend/AcceptEx/...）
     virtual void issue_io() noexcept = 0;
 
     void finish_issue(DWORD ioresult, DWORD /*bytes*/) noexcept {
+        // 完成 I/O 提交的统一处理：
+        //   1. 如果 ioresult == 0（同步成功），调用 on_pending 但操作已经完成
+        //   2. 如果 WSAGetLastError() == WSA_IO_PENDING，真正的异步等待
+        //   3. 其他错误，直接 post 失败结果给协程
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
         if (ioresult == 0) {
@@ -76,11 +102,13 @@ protected:
             }
         }
         op_.release();
+        // 释放 ownership：operation 的所有权转移到 IOCP 或完成回调中
     }
 
 public:
     std::unique_ptr<platform::iocp::iocp_operation> op_;
     // Public: accessed by chained_awaiter, handle_completion, operator&&
+    // 公开成员：供 chained_awaiter、handle_completion 和 operator&& 访问
     task_info io_info_;
     uintptr_t sock_ = 0;
 };
@@ -88,6 +116,23 @@ public:
 // ============================================================
 // AcceptEx / ConnectEx dynamic loading
 // ============================================================
+// AcceptEx / ConnectEx 动态加载
+//
+// 为什么需要动态加载？
+//   AcceptEx 和 ConnectEx 是 Microsoft 在 Winsock2 之后增加的扩展 API，
+//   不在标准 winsock2.h 中导出，需要通过 WSAIoctl + SIO_GET_EXTENSION_FUNCTION_POINTER
+//   动态获取函数指针。这是 Windows 套接字扩展的通用模式。
+//
+//   AcceptEx 的特点：
+//     - 支持接受连接的同时读取第一个数据包（减少一次 context switch）
+//     - 需要在调用前预先创建 accept socket
+//     - 需要提供两个地址缓冲区（本地地址 + 远程地址），大小必须至少为 sizeof(sockaddr_storage) + 16
+//     - 连接接受后需要调用 setsockopt(SO_UPDATE_ACCEPT_CONTEXT) 使新 socket 继承监听 socket 的属性
+//
+//   ConnectEx 的特点：
+//     - 支持连接的异步发起
+//     - 调用前 socket 必须已经 bind 到本地地址
+//     - 调用前 socket 必须是未连接的
 
 namespace {
 
@@ -120,6 +165,7 @@ inline LPFN_CONNECTEX load_connect_ex() noexcept {
 }
 
 inline LPFN_ACCEPTEX get_accept_ex() noexcept {
+    // 静态局部变量：首次调用时加载，后续复用
     static LPFN_ACCEPTEX fn = load_accept_ex();
     return fn;
 }
@@ -134,6 +180,7 @@ inline LPFN_CONNECTEX get_connect_ex() noexcept {
 // ============================================================
 // Concrete I/O operations
 // ============================================================
+// 具体的 I/O 操作实现
 
 struct win_recv final : win_awaiter {
     win_recv(uintptr_t sock, std::span<char> buf, int flags = 0) noexcept
@@ -141,6 +188,8 @@ struct win_recv final : win_awaiter {
 
 private:
     void issue_io() noexcept override {
+        // WSARecv 是 Windows 的异步 socket 接收 API。
+        // WSABUF 是 Windows 的 scatter/gather I/O 缓冲区描述符。
         WSABUF wbuf{.len = static_cast<ULONG>(buf_.size()), .buf = buf_.data()};
         DWORD fl = flags_, bytes = 0;
         int ret = ::WSARecv((SOCKET)sock_, &wbuf, 1, &bytes, &fl,
@@ -162,6 +211,7 @@ struct win_send final : win_awaiter {
 
 private:
     void issue_io() noexcept override {
+        // WSASend 是 Windows 的异步 socket 发送 API。
         DWORD bytes = 0;
         int ret = ::WSASend((SOCKET)sock_, &wbuf_, 1, &bytes, flags_,
             static_cast<OVERLAPPED*>(op_->native_overlapped()), nullptr);
@@ -180,16 +230,21 @@ struct win_accept final : win_awaiter {
     }
 
     [[nodiscard]] int32_t await_resume() const noexcept {
+        // await_resume 返回 accept 的新 socket 句柄（而非字节数）
+        // 这是 IOCP 特有的：AcceptEx 需要预先创建 accept socket
         return static_cast<int32_t>(accept_socket_);
     }
 
 private:
     void create_accept_socket() noexcept {
+        // AcceptEx 要求预先创建一个 socket 用于接受连接。
+        // 使用 WSA_FLAG_OVERLAPPED 标志使其支持重叠 I/O。
         accept_socket_ = ::WSASocketW(AF_INET, SOCK_STREAM, 0,
                                        nullptr, 0, WSA_FLAG_OVERLAPPED);
         if (accept_socket_ != INVALID_SOCKET) {
             auto* p = static_cast<platform::iocp::iocp_proactor*>(
                 this_thread.worker->proactor);
+            // 新 socket 必须关联到 IOCP，否则完成事件无法投递
             p->register_handle(accept_socket_);
         }
     }
@@ -205,8 +260,12 @@ private:
 
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
+        // 监听 socket 也需要关联到 IOCP
         p->register_handle(sock_);
 
+        // AcceptEx 地址缓冲区：
+        //   需要同时容纳本地地址和远程地址，每个地址需要额外的 16 字节填充。
+        //   sizeof(sockaddr_storage) * 2 + 32 确保足够大。
         DWORD addr_buf_len = sizeof(sockaddr_storage) + 16;
         memset(addr_buf_, 0, sizeof(addr_buf_));
         DWORD bytes_received = 0;
@@ -222,6 +281,7 @@ private:
             } else {
                 ::closesocket(accept_socket_);
                 if (err == ERROR_CONNECTION_ABORTED) {
+                    // 连接被中止：典型的 Windows accept 错误，需要重试
                     create_accept_socket();
                     if (accept_socket_ != INVALID_SOCKET) {
                         issue_io();
@@ -234,6 +294,7 @@ private:
                 op_.release();
             }
         } else {
+            // 同步完成（罕见但可能）
             op_->Internal = 0;
             op_->InternalHigh = bytes_received;
             finish_issue(0, bytes_received);
@@ -261,6 +322,8 @@ private:
             this_thread.worker->proactor);
         p->register_handle(sock_);
 
+        // ConnectEx 要求 socket 必须先 bind
+        // 绑定到 INADDR_ANY + 端口 0 让系统自动选择
         struct sockaddr_in local{};
         local.sin_family = AF_INET;
         local.sin_addr.s_addr = INADDR_ANY;
@@ -268,6 +331,7 @@ private:
         ::bind((SOCKET)sock_, reinterpret_cast<struct sockaddr*>(&local),
                sizeof(local));
 
+        // 调用 ConnectEx 异步发起连接
         BOOL ok = fn((SOCKET)sock_, addr_, addrlen_, nullptr, 0, nullptr,
             static_cast<OVERLAPPED*>(op_->native_overlapped()));
 
@@ -281,6 +345,7 @@ private:
                 finish_issue(1, 0);
             }
         } else {
+            // 同步连接成功（罕见）
             finish_issue(0, 0);
         }
     }
@@ -292,9 +357,12 @@ struct win_close final : win_awaiter {
     explicit win_close(uintptr_t sock) noexcept : win_awaiter() { sock_ = sock; }
 private:
     void issue_io() noexcept override {
+        // closesocket 是同步操作，没有重叠 I/O 版本。
+        // 执行完后通过 on_sync_completion 手动 post 完成事件到 IOCP。
         ::closesocket((SOCKET)sock_);
         io_info_.result = 0;
         // Post completion manually — closesocket is synchronous, not overlapped
+        // 手动 post 完成事件 — closesocket 是同步的，不是重叠 I/O
         op_->on_sync_completion(
             static_cast<platform::iocp::iocp_proactor*>(
                 this_thread.worker->proactor), 0);
@@ -306,8 +374,10 @@ struct win_nop final : win_awaiter {
     win_nop() noexcept : win_awaiter() {}
 private:
     void issue_io() noexcept override {
+        // NOP（空操作）：立即成功，通过 on_sync_completion 手动 post 完成事件
         io_info_.result = 0;
         // Post completion manually — nop is synchronous, not overlapped
+        // 手动 post 完成事件 — nop 是同步的，不是重叠 I/O
         op_->on_sync_completion(
             static_cast<platform::iocp::iocp_proactor*>(
                 this_thread.worker->proactor), 0);
@@ -318,6 +388,14 @@ private:
 /// Windows timeout: delegates blocking wait to a background thread that
 /// posts IOCP completion after the delay. The operation is kept alive by
 /// the thread via raw pointer ownership transfer.
+// Windows 超时：将阻塞等待委托给后台线程，延迟后通过 IOCP 投递完成事件。
+// 操作对象的所有权通过裸指针转移给后台线程以保证其生命周期。
+//
+// 为什么需要后台线程？
+//   Windows 没有像 Linux timerfd 或 io_uring timeout 这样的异步定时器机制，
+//   IOCP 本身不直接支持超时。唯一的方案是启动一个后台线程调用 Sleep()，
+//   然后通过 PostQueuedCompletionStatus 或 on_sync_completion 通知完成。
+//   这虽然有一个线程创建的开销，但对于定时器操作来说可以接受。
 struct win_timeout final : win_awaiter {
     template<typename Rep, typename Period>
     explicit win_timeout(const std::chrono::duration<Rep, Period>& dur) noexcept
@@ -329,10 +407,12 @@ struct win_timeout final : win_awaiter {
 private:
     void issue_io() noexcept override {
         auto* raw_op = op_.release();        // transfer ownership to background thread
+        // 通过 release 转移 ownership 到后台线程
         auto* proactor = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
         DWORD ms = static_cast<DWORD>(dur_ms_);
         // Background thread: sleep → signal IOCP completion (via on_sync_completion)
+        // 后台线程：休眠指定时间 → 通过 on_sync_completion 通知 IOCP 完成
         std::thread([raw_op, proactor, ms]() noexcept {
             Sleep(ms);
             raw_op->on_sync_completion(proactor, 0);
@@ -343,6 +423,16 @@ private:
 };
 
 /// Windows async read (file/pipe/console): uses background thread + _read + IOCP.
+// Windows 异步读（文件/管道/控制台）：使用后台线程 + _read + IOCP。
+//
+// 为什么需要后台线程？
+//   IOCP 原生只支持 socket 和 named pipe 的异步 I/O。
+//   普通文件的异步 I/O 需要特定的文件标志（FILE_FLAG_OVERLAPPED）以及正确的设备类型支持。
+//   对于不支持重叠 I/O 的文件描述符（如通过 _open 打开的文件），
+//   只能使用后台线程模拟异步。
+//
+//   使用后台线程 + _read + IOCP 完成回调的模式：
+//   后台线程执行阻塞的 _read，完成后通过 on_sync_completion 通知原始线程。
 struct win_read final : win_awaiter {
     win_read(int fd, std::span<char> buf, uint64_t /*offset*/) noexcept
         : win_awaiter() { fd_ = fd; buf_ = buf; }
@@ -362,6 +452,7 @@ private:
 };
 
 /// Windows async write (file/pipe/console): uses background thread + _write + IOCP.
+// Windows 异步写（文件/管道/控制台）：使用后台线程 + _write + IOCP。
 struct win_write final : win_awaiter {
     win_write(int fd, std::span<const char> buf, uint64_t /*offset*/) noexcept
         : win_awaiter() { fd_ = fd; buf_ = buf; }
@@ -386,9 +477,12 @@ struct win_shutdown final : win_awaiter {
     }
 private:
     void issue_io() noexcept override {
+        // shutdown 是同步操作，没有重叠 I/O 版本。
+        // 与 closesocket 一样，通过 on_sync_completion 手动 post 完成事件。
         int ret = ::shutdown((SOCKET)sock_, how_);
         io_info_.result = (ret == 0) ? 0 : -::WSAGetLastError();
         // Post completion manually — shutdown is synchronous, not overlapped
+        // 手动 post 完成事件 — shutdown 是同步的，不是重叠 I/O
         op_->on_sync_completion(
             static_cast<platform::iocp::iocp_proactor*>(
                 this_thread.worker->proactor), 0);
@@ -400,6 +494,11 @@ private:
 } // namespace coronet::detail
 
 // Platform factory functions — uniform interface for async_io.hpp
+// 平台工厂函数 — 为 async_io.hpp 提供统一接口
+// 与 io_uring 版本相同，通过 platform_io 命名空间导出工厂函数
+// 注意：Windows 的文件描述符在 win_read/win_write 中直接使用 int fd，
+// 而 socket 操作使用 uintptr_t（因为 Windows SOCKET 是 UINT_PTR 类型）。
+// 这与 Linux 平台不同（Linux 上 socket fd 和文件 fd 都是 int）。
 namespace coronet::detail::platform_io {
     inline auto make_recv(int fd, std::span<char> buf, int flags) noexcept
         { return win_recv{(uintptr_t)fd, buf, flags}; }
