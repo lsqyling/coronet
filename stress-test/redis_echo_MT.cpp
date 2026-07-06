@@ -71,25 +71,14 @@ int main(int argc, char* argv[]) {
 
     // Create N io_contexts — one per worker thread
     std::vector<coronet::io_context> workers(nthreads);
+    coronet::io_context balancer;
 
-    // Spawn acceptor coroutine on worker[0]
-    workers[0].co_spawn(acceptor_task(port, workers, nthreads));
+    balancer.co_spawn(acceptor_task(port, workers, nthreads));
+    balancer.start();
 
-    // Launch host threads for all workers
-    std::vector<std::thread> starter_threads;
-    for (int i = 0; i < nthreads; ++i) {
-        starter_threads.emplace_back([&workers, i] {
-            workers[i].start();
-        });
+    for(auto &ctx : workers) {
+        ctx.start();
     }
-
-    // Wait for all starter threads to finish (they return from start() quickly)
-    for (auto& t : starter_threads) t.join();
-
-    // Keep the process alive — workers run until killed externally
-    for (int i = 0; i < nthreads; ++i) {
-        workers[i].join();
-    }
-
+    balancer.join();
     return 0;
 }

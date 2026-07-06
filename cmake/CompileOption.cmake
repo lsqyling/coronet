@@ -17,9 +17,8 @@ endif()
 
 # Release build optimizations
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        add_compile_options(-march=native)
-    endif()
+    # 它会探测宿主机的 CPU 支持哪些扩展（如 AVX-512、AVX2、SSE4.2 等），并将这些指令集直接编译进二进制文件
+    target_compile_options(coronet PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-march=native>)
     # Enable LTO when available
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_supported OUTPUT ipo_output)
@@ -29,6 +28,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 # MSVC: UTF-8 for Chinese comments in source files
-if(MSVC)
-    target_compile_options(coronet PUBLIC /utf-8)
-endif()
+target_compile_options(coronet PUBLIC
+        $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
+)

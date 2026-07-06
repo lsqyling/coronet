@@ -1,4 +1,6 @@
 #include "coronet/platform/iocp/iocp_proactor.hpp"
+#include "coronet/log/log.hpp"
+
 
 #include <cstdio>
 #include <cstdlib>
@@ -92,7 +94,7 @@ void iocp_proactor::init(uint32_t entries) {
     // 最后一个参数 0 表示允许任意数量的并发线程处理完成事件（由内核调度）。
     iocp_handle_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
     if (!iocp_handle_) {
-        std::fprintf(stderr, "iocp_proactor: CreateIoCompletionPort failed\n");
+        log::d("iocp_proactor: CreateIoCompletionPort failed\n");
         std::abort();
     }
 }
@@ -104,7 +106,7 @@ void iocp_proactor::deinit() noexcept {
     }
     // 排空 IOCP 队列中所有待处理的完成事件
     // 循环读取直到没有更多事件（key=1 是退出信号，会跳过）
-    for (int i = 0; i < 1000; ++i) {
+    while (true) {
         DWORD bytes = 0;
         ULONG_PTR key = 0;
         OVERLAPPED* ov = nullptr;
