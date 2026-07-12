@@ -113,7 +113,7 @@ void worker_meta::forward_task(std::coroutine_handle<> handle) noexcept {
     config::cur_t slot = reap_cur.push();
     if (slot == config::cur_t(-1)) [[unlikely]] {
         // 环溢出意味着设计容量不足，直接终止以避免静默丢失协程句柄
-        std::fprintf(stderr, "worker_meta: reap_swap overflow!\n");
+        log::e("worker_meta: reap_swap overflow!\n");
         std::abort();
     }
     reap_swap[slot] = handle;
