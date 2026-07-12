@@ -179,6 +179,372 @@ io_context (单线程事件循环)
 
 ---
 
+## 📊 调用流程 / Call-Flow Diagrams
+
+下面通过 Mermaid 时序图和数据流图展示 coronet 核心机制的运行时调用关系。
+
+### 1. Fibonacci 生成器 — 协程生命周期
+
+`test/generator_gtest.cpp` 中 Fibonacci 测试用例的完整调用时序。
+
+```mermaid
+sequenceDiagram
+    participant Test
+    participant Fib as "fib() coroutine"
+    participant Promise as "promise_type"
+    participant Iterator as "_Gen_iter"
+    participant Awaiter as "_Element_awaiter"
+    participant Final as "_Final_awaiter"
+
+    Test->>Fib: fib() called
+    activate Fib
+    Note over Fib: 编译器分配协程帧
+    Fib->>Promise: promise_type::operator new
+    Fib->>Promise: initial_suspend() returns suspend_always
+    Fib->>Test: return generator handle
+    deactivate Fib
+    Note over Fib: 协程体尚未执行 - 惰性求值
+
+    rect rgb(240, 248, 255)
+    Note over Test,Iterator: 范围 for: begin()
+    Test->>Iterator: begin() calls _Coro.resume()
+    activate Iterator
+    Iterator->>Fib: 首次恢复执行
+    activate Fib
+    Note over Fib: a=0, b=1, while true
+    Fib->>Awaiter: co_yield a -> yield_value(a)
+    activate Awaiter
+    Note over Awaiter: 拷贝值, 存入 _Ptr
+    Awaiter->>Fib: await_suspend - 协程挂起
+    deactivate Awaiter
+    deactivate Fib
+    Iterator->>Test: return iterator handle
+    deactivate Iterator
+
+    Note over Test,Iterator: 第1次迭代: value = 0
+    Test->>Iterator: *it (operator*)
+    Iterator->>Iterator: _Coro.promise()._Top.promise()._Ptr
+    Iterator->>Test: 0
+    Test->>Test: results.push_back(0)
+
+    Test->>Iterator: ++it (operator++)
+    activate Iterator
+    Iterator->>Fib: _Top.resume()
+    activate Fib
+    Note over Fib: next=1, a=1, b=1
+    Fib->>Awaiter: co_yield 1 -> yield_value(1)
+    activate Awaiter
+    Awaiter->>Fib: await_suspend - 挂起
+    deactivate Awaiter
+    deactivate Fib
+    deactivate Iterator
+
+    Note over Test,Iterator: 重复 11 次...
+    Note over Test,Iterator: 最后一次: value = 89
+
+    Test->>Iterator: ++it (最后一次)
+    activate Iterator
+    Iterator->>Fib: _Top.resume()
+    activate Fib
+    Note over Fib: a=144 > 100, 循环退出
+    Fib->>Promise: return_void()
+    Promise->>Final: final_suspend()
+    activate Final
+    Note over Final: _Info == nullptr (无嵌套)
+    Final->>Final: return noop_coroutine()
+    deactivate Final
+    Note over Fib: done() == true
+    deactivate Fib
+    deactivate Iterator
+
+    Test->>Iterator: it == end -> 循环退出
+    Note over Test: range-for 结束
+    end
+
+    Test->>Fib: ~generator() 析构
+    activate Fib
+    Fib->>Promise: _Coro.destroy()
+    Note over Promise: 释放协程帧
+    deactivate Fib
+```
+
+---
+
+### 2. 异步定时器 — 3 个并发定时器
+
+`test/timer.cpp` 中启动 3 个定时器的测试。两个 1 秒定时器各运行 2 轮，一个 3 秒定时器运行 1 轮，外加 6 秒停止协程。
+
+```mermaid  
+sequenceDiagram
+    participant Main
+    participant Ctx as io_context
+    participant EvLoop as EventLoop
+    participant T1 as "cycle_n (1s, 2rds)"
+    participant T1b as "cycle_n (1s, 2rds) rel"
+    participant T3 as "cycle_n (3s, 1rd)"
+    participant Stop as "stop_after (6s)"
+    participant Timer as "platform::timeout"
+
+    Main->>Ctx: co_spawn(task) x4
+    Note over Ctx: 全部协程在 initial_suspend 挂起
+    Main->>Ctx: start() (启动事件循环线程)
+
+    activate EvLoop
+    EvLoop->>EvLoop: drain_cross_thread()
+    EvLoop->>EvLoop: do_worker_part()
+
+    par 定时器并行启动
+        T1->>T1: co_await async::timeout(1s)
+        T1->>Timer: 注册定时器
+        T1->>T1: suspend
+        T1b->>T1b: co_await async::timeout(1s)
+        T1b->>Timer: 注册定时器
+        T1b->>T1b: suspend
+        T3->>T3: co_await async::timeout(3s)
+        T3->>Timer: 注册定时器
+        T3->>T3: suspend
+        Stop->>Stop: co_await async::timeout(6s)
+        Stop->>Timer: 注册定时器
+        Stop->>Stop: suspend
+    end
+
+    Note over Timer: ~1 秒后
+    Timer->>EvLoop: 两个 1s 定时器到期
+    EvLoop->>EvLoop: handle_completion -> forward_task
+    EvLoop->>T1: resume (第1轮完成)
+    EvLoop->>T1b: resume (第1轮完成)
+    T1->>Timer: 第2轮 co_await async::timeout(1s)
+    T1b->>Timer: 第2轮 co_await async::timeout(1s)
+
+    Note over Timer: ~2 秒后
+    Timer->>EvLoop: 两个 1s 定时器再次到期
+    EvLoop->>T1: resume (第2轮完成, 退出)
+    EvLoop->>T1b: resume (第2轮完成, 退出)
+
+    Note over Timer: ~3 秒后
+    Timer->>EvLoop: 3s 定时器到期
+    EvLoop->>T3: resume (完成, 退出)
+
+    Note over Timer: ~6 秒后
+    Timer->>EvLoop: 6s 定时器到期
+    EvLoop->>Stop: resume
+    Stop->>Ctx: can_stop()
+    Ctx->>EvLoop: will_stop_ = true
+    deactivate EvLoop
+
+    Main->>Ctx: join() 返回, 测试结束
+```
+
+```mermaid  
+flowchart TD
+    A["cycle_n 协程<br/>co_await async::timeout(D)"] --> B["make_timeout(dur)<br/>async_io.hpp 工厂函数"]
+    B --> C["platform_io::make_timeout(dur)"]
+    C --> D{"编译期平台选择<br/>Compile-time dispatch"}
+
+    D -->|Windows IOCP| E1["win_timeout::issue_io()<br/>iocp_win_io.hpp:408"]
+    E1 --> F1["后台线程 / Background thread<br/>Sleep(ms)"]
+    F1 --> G1["on_sync_completion()<br/>PostQueuedCompletionStatus"]
+
+    D -->|Linux io_uring| E2["io_uring_timeout<br/>prep_timeout(SQE)"]
+    E2 --> F2["do_submission_part()<br/>io_uring_enter 提交"]
+    F2 --> G2["内核 CQE ready<br/>IORING_OP_TIMEOUT"]
+
+    D -->|Linux epoll| E3["epoll_timeout<br/>timerfd_settime()"]
+    E3 --> F3["epoll_wait 返回"]
+    F3 --> G3["do_perform → read timerfd"]
+
+    G1 --> H["proactor.wait_completion()<br/>收割完成事件"]
+    G2 --> H
+    G3 --> H
+
+    H --> I["worker_meta::handle_completion()<br/>解码 task_info, 设置 result"]
+    I --> J["forward_task(handle)<br/>→ SPSC 环 (lock-free)"]
+    J --> K["do_worker_part()<br/>从 SPSC 环弹出"]
+    K --> L["coroutine_handle::resume()"]
+    L --> M["co_await async::timeout() 返回"]
+    M --> A
+```
+
+---
+
+### 3. CSP 通道 — 3 生产者 / 3 消费者
+
+`test/channel.cpp` 测试：3 个生产者各发送 4 条消息（2 条快速 + 2 条带 200ms 延迟），共 12 条消息被 3 个消费者并发消费。
+
+```mermaid
+sequenceDiagram
+    participant Main
+    participant Ctx as io_context
+    participant EvLoop as EventLoop
+    participant P0 as "produce(p0)"
+    participant P1 as "produce(p1)"
+    participant P2 as "produce(p2)"
+    participant C0 as "consume(c0)"
+    participant C1 as "consume(c1)"
+    participant C2 as "consume(c2)"
+    participant Ch as "channel (buffer=4)"
+    participant Stop as "stopper (8s)"
+
+    Main->>Ctx: co_spawn 7 tasks (3P + 3C + stopper)
+    Main->>Ctx: start()
+    activate EvLoop
+    EvLoop->>EvLoop: drain_cross_thread + do_worker_part
+
+    par 快速生产阶段
+        P0->>Ch: release("p0: fast produce") 第1次
+        Note over Ch: lock, !full(), construct_at, push_one<br/>unlock, notify not_empty
+        P0->>Ch: release("p0: fast produce") 第2次
+        P1->>Ch: release("p1: fast produce") x2
+        P2->>Ch: release("p2: fast produce") x2
+    end
+
+    Note over Ch: 缓冲占用: 6/4 (部分生产者等待 not_full)
+
+    par 消费阶段
+        C0->>Ch: acquire()
+        Note over Ch: lock, !empty(), move item<br/>destroy_at, pop_one, unlock
+        Ch->>C0: return string
+        C0->>C0: printf (1/12)
+        C1->>Ch: acquire()
+        Ch->>C1: return string
+        C1->>C1: printf (2/12)
+        C2->>Ch: acquire()
+        Ch->>C2: return string
+        C2->>C2: printf (3/12)
+    end
+
+    par 慢速生产 + 消费交替
+        P0->>P0: async::timeout(200ms)
+        P0->>Ch: release("p0: slow produce")
+        C0->>Ch: acquire()
+        Ch->>C0: return string
+        Note over C0,C2: ... 共 12 条消息全部消费 ...
+    end
+
+    Note over C0,C2: 全部 12 条消息消费完毕
+
+    Note over Stop: 安全兜底: 8 秒后强制停止
+    Stop->>Ctx: can_stop()
+    Ctx->>EvLoop: will_stop_ = true
+    deactivate EvLoop
+    Main->>Ctx: join() 返回
+    Note over Main: assert(msg_consumed >= 12)
+```
+
+---
+
+### 4. TCP Echo 服务器/客户端 — 双线程 Echo
+
+`examples/echo_server_client.cpp` 中服务器端和客户端的完整调用时序和数据流。
+
+```mermaid
+sequenceDiagram
+    participant Main
+    participant SCtx as server_ctx
+    participant Svr as echo_server
+    participant Ses as echo_session
+    participant CCtx as client_ctx
+    participant Cli as echo_client
+    participant SkC as socket(client)
+    participant SkS as socket(server)
+    participant TCP as TCP Kernel
+
+    Note over Main: === 阶段 1: 启动服务器 ===
+    Main->>SCtx: co_spawn(echo_server())
+    SCtx->>Svr: resume
+    activate Svr
+    Note over Svr: acceptor(inet_address{9090})<br/>create_tcp → set_reuse → bind → listen
+    Svr->>SkS: co_await ac.accept()
+    Note over Svr: 挂起, 等待连接 / suspended, waiting for connection
+    deactivate Svr
+
+    Note over Main: sleep(100ms) — 给服务器时间启动
+
+    Note over Main: === 阶段 2: 客户端连接 ===
+    Main->>CCtx: co_spawn(echo_client(...))
+    CCtx->>Cli: resume
+    activate Cli
+    Cli->>Cli: inet_address::resolve("127.0.0.1", 9090)
+    Cli->>SkC: socket::create_tcp()
+    Cli->>SkC: co_await sock.connect(addr)
+    SkC->>TCP: SYN
+    TCP->>SkS: 连接到达, accept 被唤醒
+    activate Svr
+    SkS->>Svr: accept 返回新连接 fd
+    deactivate Svr
+    Svr->>Ses: co_spawn(echo_session(sock))
+    activate Ses
+    SkC->>Cli: connect 返回 0 (连接成功)
+    deactivate Cli
+
+    Note over Main: === 阶段 3: 数据收发 (Echo) ===
+    Cli->>SkC: co_await sock.send(TestMsg)
+    SkC->>TCP: TCP 数据包
+    TCP->>SkS: 数据到达
+    Ses->>SkS: co_await sock.recv(buf)
+    SkS->>Ses: recv 返回 nr 字节
+    Ses->>SkS: co_await sock.send(buf, nr)
+    SkS->>TCP: Echo 数据
+    TCP->>SkC: Echo 返回
+    Cli->>SkC: co_await sock.recv(buf)
+    SkC->>Cli: recv 返回, 验证 Echo 内容
+
+    Note over Main: === 阶段 4: 清理 ===
+    Cli->>SkC: co_await sock.shutdown_write()
+    Cli->>CCtx: ctx.can_stop()
+    CCtx->>Main: join() 返回
+    Main->>SCtx: ctx.can_stop()
+    SCtx->>Main: join() 返回
+    deactivate Ses
+```
+
+```mermaid
+flowchart LR
+    subgraph Main_Thread["主线程 / Main Thread (client_ctx)"]
+        CL[echo_client 协程]
+        SKC[socket client<br/>RAII fd]
+    end
+
+    subgraph Server_Thread["后台线程 / Server Thread (server_ctx)"]
+        SV[echo_server 协程]
+        AC[acceptor<br/>listen socket]
+        SS[echo_session 协程]
+        SKS[socket server<br/>RAII fd]
+    end
+
+    subgraph Kernel["操作系统内核 / Kernel"]
+        TCP["TCP/IP 协议栈<br/>(loopback/Linux/Windows)"]
+    end
+
+    CL -->|"① connect(127.0.0.1:9090)"| SKC
+    SKC -->|"SYN →"| TCP
+    TCP -->|"accept 唤醒"| AC
+    AC -->|"返回 connected fd"| SV
+    SV -->|"co_spawn"| SS
+
+    CL -->|"② send(TestMsg)"| SKC
+    SKC -->|"TCP data →"| TCP
+    TCP -->|"→ data in"| SKS
+    SKS -->|"③ recv(buf)"| SS
+
+    SS -->|"④ send({buf, nr})"| SKS
+    SKS -->|"TCP echo →"| TCP
+    TCP -->|"→ echo data"| SKC
+    SKC -->|"⑤ recv(buf)"| CL
+
+    CL -->|"⑥ 验证 echo 内容"| CL
+    CL -->|"⑦ shutdown_write + can_stop()"| CL
+
+    style CL fill:#d4f0d4,stroke:#333
+    style SS fill:#d4f0d4,stroke:#333
+    style AC fill:#e8e8ff,stroke:#333
+    style TCP fill:#fff3cd,stroke:#333
+    style SKC fill:#f0f0f0,stroke:#999
+    style SKS fill:#f0f0f0,stroke:#999
+```
+
+---
+
 ## 📦 CMake 选项
 
 | 选项 | 默认 | 说明 |
