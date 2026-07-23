@@ -31,3 +31,4 @@ endif()
 target_compile_options(coronet PUBLIC
         $<$<CXX_COMPILER_ID:MSVC>:/utf-8>
 )
+# NOTE: CMAKE_EXPORT_COMPILE_COMMANDS is set in the top-level CMakeLists.txt

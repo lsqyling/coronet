@@ -4,6 +4,14 @@ project(coronet
         LANGUAGES CXX)
 
 # ============================================================
+# Export compile_commands.json for IDE / LSP (clangd, ccls)
+#   - Only effective with Makefile / Ninja generators
+#   - Visual Studio (MSBuild) generator silently ignores this
+#   - For nvim gd / header-source switching, build with -G Ninja
+# ============================================================
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ============================================================
 # Library target
 # ============================================================
 add_library(coronet STATIC)

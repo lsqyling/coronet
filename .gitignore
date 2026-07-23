@@ -1,3 +1,10 @@
+# ai vibe coding cache
+.opencode
+.claude
+.workbuddy
+
+# Cache
+.cache
 # Build directories
 build-debug/
 build-release/
