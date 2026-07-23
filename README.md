@@ -552,8 +552,10 @@ flowchart LR
 
 | 分支 | `CORONET_DEVELOPER_MODE` | 构建目标 | 子模块 |
 |:-----|:---:|------|:---:|
-| `main` | OFF | 仅库 (`coronet`) | 可选 |
-| `develop` | ON | 库 + 测试 + 示例 + 基准 + 压测 | **必须** |
+| `main` / `master` | **自动 OFF** | 仅库 (`coronet`) | 可选 |
+| `develop` / 其他 | **自动 ON** | 库 + 测试 + 示例 + 基准 + 压测 | **必须** |
+
+CMake 配置时会自动执行 `git rev-parse --abbrev-ref HEAD` 检测当前分支，`main`/`master` 默认关闭开发模式，其余分支默认开启。**同一份代码，不同分支自动走不同默认值**，无需手动修改 `Option.cmake`。
 
 `CORONET_DEVELOPER_MODE` 是一个批量开关，会同时开启 `CORONET_BUILD_{TESTS,BENCHMARKS,STRESS_TESTS,EXAMPLES}`。使用者可以根据需要单独控制：
 
@@ -578,14 +580,14 @@ cmake -S . -B build -G Ninja -DCORONET_DEVELOPER_MODE=OFF -DCORONET_BUILD_TESTS=
 
 | 选项 | 默认 | 说明 |
 |------|:---:|------|
-| `CORONET_DEVELOPER_MODE` | ON* | 批量开启测试/示例/基准/压测 |
+| `CORONET_DEVELOPER_MODE` | auto* | 批量开启测试/示例/基准/压测（自动检测 git 分支） |
 | `CORONET_IOURING` | OFF | 启用 io_uring 替代 epoll |
 | `CORONET_BUILD_TESTS` | OFF | 单元测试 (gtest) |
 | `CORONET_BUILD_BENCHMARKS` | OFF | 微基准 (Google Benchmark) |
 | `CORONET_BUILD_STRESS_TESTS` | OFF | 压力测试 |
 | `CORONET_BUILD_EXAMPLES` | OFF | 示例程序 |
 
-> \* `develop` 分支默认 ON，`main` 分支默认 OFF
+> \* `main`/`master` 分支自动 OFF，其余分支自动 ON；可通过 `-DCORONET_DEVELOPER_MODE=ON/OFF` 手动覆盖
 
 ---
 
