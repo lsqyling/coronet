@@ -48,8 +48,11 @@
 ## ⚡ 快速开始
 
 ```bash
-# 克隆
-git clone https://github.com/lsqyling/coronet.git && cd coronet
+# 克隆（含子模块）
+git clone --recursive https://github.com/lsqyling/coronet.git && cd coronet
+
+# 已克隆但未拉取子模块时：
+git submodule update --init --recursive
 
 # Linux — 默认 epoll 后端(Release)
 cmake -S . -B build -G Ninja
@@ -545,17 +548,44 @@ flowchart LR
 
 ---
 
+## 🌿 分支与构建模式
+
+| 分支 | `CORONET_DEVELOPER_MODE` | 构建目标 | 子模块 |
+|:-----|:---:|------|:---:|
+| `main` | OFF | 仅库 (`coronet`) | 可选 |
+| `develop` | ON | 库 + 测试 + 示例 + 基准 + 压测 | **必须** |
+
+`CORONET_DEVELOPER_MODE` 是一个批量开关，会同时开启 `CORONET_BUILD_{TESTS,BENCHMARKS,STRESS_TESTS,EXAMPLES}`。使用者可以根据需要单独控制：
+
+```bash
+# main 分支用户 — 仅编译库（默认）
+cmake -S . -B build -G Ninja
+
+# develop 分支用户 — 编译全部（默认，需要子模块）
+git clone --recursive https://github.com/lsqyling/coronet.git
+cmake -S . -B build -G Ninja
+
+# 手动关闭开发模式，回到纯库模式
+cmake -S . -B build -G Ninja -DCORONET_DEVELOPER_MODE=OFF
+
+# 仅开启测试，不构建基准和示例
+cmake -S . -B build -G Ninja -DCORONET_DEVELOPER_MODE=OFF -DCORONET_BUILD_TESTS=ON
+```
+
+---
+
 ## 📦 CMake 选项
 
 | 选项 | 默认 | 说明 |
 |------|:---:|------|
+| `CORONET_DEVELOPER_MODE` | ON* | 批量开启测试/示例/基准/压测 |
 | `CORONET_IOURING` | OFF | 启用 io_uring 替代 epoll |
-| `CORONET_BUILD_TESTS` | ON* | 21 项单元+集成测试 (CTest) |
-| `CORONET_BUILD_BENCHMARKS` | ON | Google Benchmark 微基准 |
-| `CORONET_BUILD_STRESS_TESTS` | OFF | 压力测试 (redis-benchmark + redis_loadgen) |
-| `CORONET_BUILD_EXAMPLES` | ON* | 示例程序 |
+| `CORONET_BUILD_TESTS` | OFF | 单元测试 (gtest) |
+| `CORONET_BUILD_BENCHMARKS` | OFF | 微基准 (Google Benchmark) |
+| `CORONET_BUILD_STRESS_TESTS` | OFF | 压力测试 |
+| `CORONET_BUILD_EXAMPLES` | OFF | 示例程序 |
 
-> \* `PROJECT_IS_TOP_LEVEL` 时默认 ON
+> \* `develop` 分支默认 ON，`main` 分支默认 OFF
 
 ---
 
