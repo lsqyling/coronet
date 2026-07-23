@@ -1,0 +1,30 @@
+# clangd configuration for coronet (cross-platform)
+#
+# - Windows (MSVC + Ninja)        → compile_commands.json in buildmsvc/
+# - Linux   (GCC/Clang + Ninja)   → compile_commands.json in build/
+#
+# clangd on Windows requires --query-driver for cl.exe (see nvim lsp.lua)
+
+# Default: Windows
+CompileFlags:
+  CompilationDatabase: D:/dev/workspace/yidaoyun/coronet/buildmsvc
+  Add:
+    - -ID:/dev/workspace/yidaoyun/coronet/include
+    - -DCORONET_PLATFORM_WINDOWS
+    - -std=c++20
+  Remove:
+    - /nologo
+    - /TP
+    - /utf-8
+    - /Fo*
+    - /Fd*
+    - /FS
+
+---
+# Linux / WSL override
+If:
+  PathExclude: '[A-Za-z]:[/\\].*'
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    - -std=c++20

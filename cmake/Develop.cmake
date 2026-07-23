@@ -1,13 +1,7 @@
 # ============================================================
 # Development targets: tests, examples, benchmarks
+# (CORONET_DEVELOPER_MODE logic is in Option.cmake, runs before Extra.cmake)
 # ============================================================
-if (CORONET_DEVELOPER_MODE)
-    set(CORONET_BUILD_EXAMPLES ON)
-    set(CORONET_BUILD_TESTS ON)
-    set(CORONET_BUILD_BENCHMARKS ON)
-    set(CORONET_BUILD_STRESS_TESTS ON)
-message(NOTICE "CORONET_DEVELOPER_MODE: ${CORONET_DEVELOPER_MODE},it means build all targets")
-endif ()
 if(CORONET_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
