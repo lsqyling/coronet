@@ -8,7 +8,23 @@ option(CORONET_BUILD_TESTS "Build unit tests (gtest)" OFF)
 option(CORONET_BUILD_BENCHMARKS "Build benchmarks (Google Benchmark)" OFF)
 option(CORONET_BUILD_STRESS_TESTS "Build stress/load tests (redis-benchmark or redis_loadgen)" OFF)
 option(CORONET_BUILD_EXAMPLES "Build examples" OFF)
-option(CORONET_DEVELOPER_MODE "Build all targets for developing" ON) # 开发分支模式，便于测试
+# ---- 自动检测 git 分支, main/master 默认关闭开发模式 ----
+execute_process(
+    COMMAND git rev-parse --abbrev-ref HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE _coronet_git_branch
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+if("${_coronet_git_branch}" STREQUAL "main" OR "${_coronet_git_branch}" STREQUAL "master")
+    set(CORONET_DEVELOPER_MODE_DEFAULT OFF)
+else()
+    set(CORONET_DEVELOPER_MODE_DEFAULT ON)
+endif()
+
+set(CORONET_DEVELOPER_MODE ${CORONET_DEVELOPER_MODE_DEFAULT}
+    CACHE BOOL "Build all targets for developing (auto-detected from git branch)")
 
 # ============================================================
 # Developer mode: enable all sub-targets
@@ -20,5 +36,7 @@ if(CORONET_DEVELOPER_MODE)
     set(CORONET_BUILD_TESTS ON)
     set(CORONET_BUILD_BENCHMARKS ON)
     set(CORONET_BUILD_STRESS_TESTS ON)
-    message(NOTICE "CORONET_DEVELOPER_MODE: ON, it means build all targets")
+    message(NOTICE "CORONET_DEVELOPER_MODE: ON (branch '${_coronet_git_branch}'), it means build all targets")
+else()
+    message(NOTICE "CORONET_DEVELOPER_MODE: OFF (branch '${_coronet_git_branch}'), building coronet library only")
 endif()
