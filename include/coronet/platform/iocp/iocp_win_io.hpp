@@ -192,6 +192,8 @@ inline LPFN_CONNECTEX get_connect_ex() noexcept {
 // 不再使用 override 关键字（CRTP 编译期分派，非虚函数覆盖）。
 
 struct win_recv final : win_awaiter_base<win_recv> {
+    friend class win_awaiter_base<win_recv>;
+
     win_recv(uintptr_t sock, std::span<char> buf, int flags = 0) noexcept
         : win_awaiter_base() { sock_ = sock; buf_ = buf; flags_ = flags; }
 
@@ -210,6 +212,8 @@ private:
 };
 
 struct win_send final : win_awaiter_base<win_send> {
+    friend class win_awaiter_base<win_send>;
+
     win_send(uintptr_t sock, std::span<const char> buf, int flags = 0) noexcept
         : win_awaiter_base() {
         sock_ = sock;
@@ -231,6 +235,8 @@ private:
 };
 
 struct win_accept final : win_awaiter_base<win_accept> {
+    friend class win_awaiter_base<win_accept>;
+
     win_accept(uintptr_t sock, struct sockaddr* addr = nullptr,
                socklen_t* addrlen = nullptr, int flags = 0) noexcept
         : win_awaiter_base() {
@@ -318,6 +324,8 @@ private:
 };
 
 struct win_connect final : win_awaiter_base<win_connect> {
+    friend class win_awaiter_base<win_connect>;
+
     win_connect(uintptr_t sock, const struct sockaddr* addr,
                 socklen_t addrlen) noexcept
         : win_awaiter_base() { sock_ = sock; addr_ = addr; addrlen_ = addrlen; }
@@ -363,6 +371,8 @@ private:
 };
 
 struct win_close final : win_awaiter_base<win_close> {
+    friend class win_awaiter_base<win_close>;
+
     explicit win_close(uintptr_t sock) noexcept : win_awaiter_base() { sock_ = sock; }
 private:
     void issue_io() noexcept {
@@ -380,6 +390,8 @@ private:
 };
 
 struct win_nop final : win_awaiter_base<win_nop> {
+    friend class win_awaiter_base<win_nop>;
+
     win_nop() noexcept : win_awaiter_base() {}
 private:
     void issue_io() noexcept {
@@ -406,6 +418,8 @@ private:
 //   然后通过 PostQueuedCompletionStatus 或 on_sync_completion 通知完成。
 //   这虽然有一个线程创建的开销，但对于定时器操作来说可以接受。
 struct win_timeout final : win_awaiter_base<win_timeout> {
+    friend class win_awaiter_base<win_timeout>;
+
     template<typename Rep, typename Period>
     explicit win_timeout(const std::chrono::duration<Rep, Period>& dur) noexcept
         : win_awaiter_base() {
@@ -443,6 +457,8 @@ private:
 //   使用后台线程 + _read + IOCP 完成回调的模式：
 //   后台线程执行阻塞的 _read，完成后通过 on_sync_completion 通知原始线程。
 struct win_read final : win_awaiter_base<win_read> {
+    friend class win_awaiter_base<win_read>;
+
     win_read(int fd, std::span<char> buf, uint64_t /*offset*/) noexcept
         : win_awaiter_base() { fd_ = fd; buf_ = buf; }
 private:
@@ -463,6 +479,8 @@ private:
 /// Windows async write (file/pipe/console): uses background thread + _write + IOCP.
 // Windows 异步写（文件/管道/控制台）：使用后台线程 + _write + IOCP。
 struct win_write final : win_awaiter_base<win_write> {
+    friend class win_awaiter_base<win_write>;
+
     win_write(int fd, std::span<const char> buf, uint64_t /*offset*/) noexcept
         : win_awaiter_base() { fd_ = fd; buf_ = buf; }
 private:
@@ -481,6 +499,8 @@ private:
 };
 
 struct win_shutdown final : win_awaiter_base<win_shutdown> {
+    friend class win_awaiter_base<win_shutdown>;
+
     win_shutdown(uintptr_t sock, int how) noexcept : win_awaiter_base() {
         sock_ = sock; how_ = how;
     }
