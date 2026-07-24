@@ -1,6 +1,8 @@
 #pragma once
 
 #include <coroutine>
+#include "coronet/detail/thread_meta.hpp"
+#include "coronet/detail/worker_meta.hpp"
 
 namespace coronet::detail {
 
@@ -59,13 +61,37 @@ public:
      * - 原始协程继续执行，检查到条件满足，释放锁
      */
     struct final_awaiter {
+        // 不在 await_suspend 中调用 current.destroy()。
+        // MSVC 协程运行时在 await_suspend 返回后可能访问协程帧，
+        // 导致 use-after-free segfault。
+        // 改为将父协程通过 spawn_handle 调度恢复，返回 void 让
+        // 运行时标记当前协程挂起（帧保持存活，由调用方后续销毁）。
+        //
+        // Do NOT call current.destroy() inside await_suspend.
+        // MSVC's coroutine runtime may access the frame after
+        // await_suspend returns, causing use-after-free.
+        // Instead, schedule the parent for resumption via the
+        // io_context and return void so the runtime leaves the
+        // frame suspended (it will be cleaned up by the caller).
         static constexpr bool await_ready() noexcept { return false; }
 
-        static std::coroutine_handle<>
+        static void
         await_suspend(std::coroutine_handle<promise_type> current) noexcept {
             auto continuation = current.promise().parent_coro;
-            current.destroy();
-            return continuation;
+            // 调度父协程恢复（直接使用 forward_task 避免循环依赖）
+            // 不在 await_suspend 中调用 current.destroy()，
+            // 以避免 MSVC 运行时在 await_suspend 返回后访问已释放帧
+            //
+            // Schedule parent resumption via forward_task (avoids
+            // circular include of io_context.hpp). Do NOT call
+            // current.destroy() here — MSVC's runtime may access
+            // the frame after await_suspend returns.
+            auto* w = coronet::detail::this_thread.worker;
+            if (w) {
+                w->forward_task(continuation);
+            }
+            // 当前帧生命周期由调用方管理
+            // Current frame lifetime managed by the caller
         }
 
         static constexpr void await_resume() noexcept {}

@@ -38,6 +38,9 @@ coronet::task<> redis_server(uint16_t port) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
     uint16_t port = DefaultPort;
     if (argc > 1) port = static_cast<uint16_t>(std::atoi(argv[1]));
 

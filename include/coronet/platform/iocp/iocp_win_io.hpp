@@ -23,6 +23,32 @@
 namespace coronet::detail {
 
 // ============================================================
+// win_chain_base — non-template base for typed chain dispatch
+// ============================================================
+// win_chain_base — 链式调用的非模板基类，提供类型化分发
+//
+// win_awaiter_base<Derived> 继承自此基类，在构造时将 chain_dispatch_fn
+// 设置为 per-type 静态分发函数（编译期已知完整 Derived 类型）。
+//
+// 与旧方案（task_info 中存储 chain_fn + chain_ctx void* 对）相比：
+//   1. 分发函数指针存储在 awaiter 自身（类型化上下文），而非通用 task_info
+//   2. 编译器在 CRTP 实例化时已知完整类型，可优化静态调用
+//   3. task_info 只需一个 chain_target 指针，节省 8 字节
+//   4. 消除了每次 operator&& 迭代时创建 lambda 的开销
+//
+// win_awaiter_base<Derived> inherits from this base. At construction,
+// chain_dispatch_fn is set to the per-type static dispatch function
+// where the complete Derived type is known at compile time.
+struct win_chain_base {
+    using dispatch_fn_t = void (*)(win_chain_base* self) noexcept;
+
+    dispatch_fn_t chain_dispatch_fn{nullptr};
+
+    /// 调用链中下一个 awaiter 的 issue_io()，使用编译期确定的完整类型
+    void chain_issue_next() noexcept { chain_dispatch_fn(this); }
+};
+
+// ============================================================
 // Base awaiter for IOCP I/O — CRTP 编译期多态
 // ============================================================
 // IOCP awaiter 基类（CRTP 版本）
@@ -49,7 +75,7 @@ namespace coronet::detail {
 //   - ioresult != 0 && WSAGetLastError() != WSA_IO_PENDING：同步失败，直接 post 错误结果
 
 template<typename Derived>
-class win_awaiter_base {
+class win_awaiter_base : public win_chain_base {
 public:
     [[nodiscard]] int32_t result() const noexcept { return io_info_.result; }
     static constexpr bool await_ready() noexcept { return false; }
@@ -60,6 +86,9 @@ public:
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
         p->work_started();
+        // 递增 inflight 操作计数，与 io_uring/epoll 后端保持一致
+        // Increment inflight operation count, consistent with io_uring/epoll backends
+        ++this_thread.worker->requests_to_reap;
         // 通过 CRTP 调用派生类的 issue_io() 执行实际的 I/O 操作
         // 编译器可内联此调用，因为派生类型在编译期已知
         static_cast<Derived*>(this)->issue_io();
@@ -79,6 +108,13 @@ public:
 
 protected:
     win_awaiter_base() noexcept {
+        // 设置 per-type 链式分发函数。chain_dispatch_fn 中的 static_cast<Derived*>
+        // 在 CRTP 实例化时确定完整类型，编译器可为每种 IO 类型生成内联版本。
+        // Set per-type chain dispatch — static_cast<Derived*> is resolved at
+        // CRTP instantiation time with the complete type known to the compiler.
+        chain_dispatch_fn = [](win_chain_base* self) noexcept {
+            static_cast<Derived*>(self)->issue_io();
+        };
         // 从 proactor 获取（或回收复用）一个 iocp_operation
         auto* p = static_cast<platform::iocp::iocp_proactor*>(
             this_thread.worker->proactor);
@@ -245,6 +281,18 @@ struct win_accept final : win_awaiter_base<win_accept> {
     }
 
     [[nodiscard]] int32_t await_resume() const noexcept {
+        // AcceptEx 完成后，必须调用 SO_UPDATE_ACCEPT_CONTEXT 使新 socket
+        // 继承监听 socket 的属性（getsockname / getpeername / shutdown 等依赖此设置）。
+        // 不调用此设置，send/recv 在多数场景下仍可工作，但某些配置下可能行为异常。
+        //
+        // After AcceptEx completes, SO_UPDATE_ACCEPT_CONTEXT must be called
+        // so the accepted socket inherits the listen socket's properties
+        // (getsockname, getpeername, shutdown, etc. depend on this).
+        SOCKET listen_sock = static_cast<SOCKET>(sock_);
+        ::setsockopt(static_cast<SOCKET>(accept_socket_), SOL_SOCKET,
+                     SO_UPDATE_ACCEPT_CONTEXT,
+                     reinterpret_cast<const char*>(&listen_sock),
+                     sizeof(listen_sock));
         // await_resume 返回 accept 的新 socket 句柄（而非字节数）
         // 这是 IOCP 特有的：AcceptEx 需要预先创建 accept socket
         return static_cast<int32_t>(accept_socket_);

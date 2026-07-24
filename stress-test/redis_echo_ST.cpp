@@ -41,6 +41,11 @@ coronet::task<> redis_server(uint16_t port) {
 }
 
 int main(int argc, char* argv[]) {
+    // 抑制 Debug 模式下的 abort() 阻塞对话框，让进程直接退出
+    // 避免 CTest 环境下弹窗阻塞 → 端口泄漏 → 下次测试冲突的死循环
+#ifdef _WIN32
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
     uint16_t port = DefaultPort;
     if (argc > 1) port = static_cast<uint16_t>(std::atoi(argv[1]));
 

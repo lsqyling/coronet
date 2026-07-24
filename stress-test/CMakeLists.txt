@@ -40,9 +40,7 @@ if(CORONET_HAS_ASIO)
     endif()
 endif()
 
-# ---- Load generator + driver ----
-add_executable(redis_loadgen  redis_loadgen.cpp)
-target_link_libraries(redis_loadgen  PRIVATE coronet::coronet)
+# ---- Stress driver ----
 add_executable(stress_driver stress_driver.cpp)
 target_link_libraries(stress_driver  PRIVATE coronet::coronet)
 if(CORONET_HAS_ASIO)
@@ -53,19 +51,21 @@ endif()
 # CTest — 通过 --server name:binary:port 配置，添加新服务端只改这里
 # ============================================================
 
-# ST: 单线程对比
+# ST: 单线程对比（使用高端口 17000+ 避免与常见服务冲突）
+# Single-threaded comparison (high ports to avoid conflicts)
 add_test(NAME stress_driver_ST COMMAND $<TARGET_FILE:stress_driver>
-    --server "coronet_ST:redis_echo_ST:6380"
-    --server "coronet_chain:redis_echo_chain:6381"
+    --server "coronet_ST:redis_echo_ST:17080"
+    --server "coronet_chain:redis_echo_chain:17081"
     $<$<BOOL:${CORONET_HAS_ASIO}>:--server>
-    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_ST:redis_echo_asio_ST:6382">
+    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_ST:redis_echo_asio_ST:17082">
     -n 10000 -c 50)
 set_tests_properties(stress_driver_ST PROPERTIES TIMEOUT 60)
 
-# MT: 多线程对比
+# MT: 多线程对比（使用高端口 17090+ 避免与常见服务冲突）
+# Multi-threaded comparison (high ports to avoid conflicts)
 add_test(NAME stress_driver_MT COMMAND $<TARGET_FILE:stress_driver>
-    --server "coronet_MT(6):redis_echo_MT:6390"
+    --server "coronet_MT(6):redis_echo_MT:17090"
     $<$<BOOL:${CORONET_HAS_ASIO}>:--server>
-    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_MT\(6\):redis_echo_asio_MT:6391">
+    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_MT\(6\):redis_echo_asio_MT:17091">
     -n 10000 -c 50)
 set_tests_properties(stress_driver_MT PROPERTIES TIMEOUT 120)

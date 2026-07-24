@@ -74,8 +74,19 @@ namespace coronet::detail {
 //     - 前台线程注册 pipe 读端到 epoll，pipe 可读时表示文件 I/O 已完成
 //   epoll_read 和 epoll_write 通过覆盖 register_with_epoll() 实现此模式。
 
+// ============================================================
+// epoll_chain_base — non-template base for typed chain dispatch
+// ============================================================
+// 与 IOCP 的 win_chain_base 相同的设计：per-type 分发函数指针存储在
+// awaiter 自身（编译期已知完整 Derived 类型），而非 task_info 的 void* 对。
+struct epoll_chain_base {
+    using dispatch_fn_t = void (*)(epoll_chain_base* self) noexcept;
+    dispatch_fn_t chain_dispatch_fn{nullptr};
+    void chain_issue_next() noexcept { chain_dispatch_fn(this); }
+};
+
 template<typename Derived>
-class epoll_awaiter_base {
+class epoll_awaiter_base : public epoll_chain_base {
 public:
     [[nodiscard]] int32_t result() const noexcept { return io_info_.result; }
     static constexpr bool await_ready() noexcept { return false; }
@@ -126,6 +137,11 @@ protected:
         op_ctx_.fd = fd;
         op_ctx_.user_data = io_info_.as_user_data()
             | uint64_t(user_data_type::task_info_ptr);
+        // Per-type chain dispatch — Derived known at CRTP instantiation time.
+        // 与 IOCP 的 win_chain_base 相同机制，编译器已知完整类型。
+        chain_dispatch_fn = [](epoll_chain_base* self) noexcept {
+            static_cast<Derived*>(self)->do_issue_io();
+        };
         // 异步操作需要递增 requests_to_reap，
         // 这样事件循环知道还有未完成的 I/O 操作在等待。
         ++this_thread.worker->requests_to_reap;

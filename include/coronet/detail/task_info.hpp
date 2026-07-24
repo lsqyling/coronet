@@ -41,8 +41,12 @@ namespace coronet::detail {
 struct task_info {
     std::coroutine_handle<> handle{nullptr};
     int32_t result{0};
-    void*  chain_ctx{nullptr};               // chained: pointer to next operation
-    void (*chain_fn)(void* ctx) noexcept {nullptr};  // chained: starts next I/O
+    // chained: pointer to next operation (win_chain_base on IOCP, void* on epoll).
+    // 分发函数存储在目标 awaiter 内部（per-type CRTP 静态函数指针），
+    // 而非 task_info 中，使编译器在 CRTP 实例化时已知完整类型。
+    // The dispatch function lives in the target awaiter (per-type CRTP static
+    // function pointer), so the compiler knows the complete type at instantiation.
+    void* chain_target{nullptr};
 
     /// Encode this pointer as the user_data for SQE / OVERLAPPED
     /// 将此指针编码为 SQE / OVERLAPPED 的 user_data

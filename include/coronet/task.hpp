@@ -43,17 +43,26 @@ struct task_final_awaiter
 template<>
 struct task_final_awaiter<void>
 {
-    constexpr bool await_ready() const noexcept { return false; }
+    // 对于已分离（detached）的 task<void>，await_ready() 返回 true，
+    // 协程在 final_suspend 点不挂起，由 C++20 运行时自动销毁帧。
+    // 这避免了在 await_suspend 内部调用 current.destroy()，
+    // 因为 MSVC 的运行时在 await_suspend 返回后仍会访问协程帧。
+    //
+    // For detached task<void>, await_ready() returns true so the
+    // runtime destroys the frame automatically, avoiding the need
+    // to call current.destroy() inside await_suspend (which MSVC's
+    // runtime does not support — it accesses the frame afterwards).
+    bool is_detached_ = false;
+
+    constexpr bool await_ready() const noexcept {
+        return is_detached_;
+    }
     template<std::derived_from<task_promise_base<void>> Promise>
     constexpr std::coroutine_handle<>
     await_suspend(std::coroutine_handle<Promise> current) const noexcept {
-        auto &promise = current.promise();
-        std::coroutine_handle<> continuation = promise.parent_coroutine;
-        // 无返回值，直接销毁，返回父协成
-        if (promise.is_detached_flag == Promise::is_detached) {
-            current.destroy();
-        }
-        return continuation;
+        // 仅非分离任务到达此处（分离任务已通过 await_ready=true 路径处理）
+        // Only non-detached tasks reach here
+        return current.promise().parent_coroutine;
     }
     constexpr void await_resume() const noexcept {}
 };
@@ -306,6 +315,17 @@ public:
     task<void> get_return_object() noexcept;
 
     constexpr void return_void() const noexcept {}
+
+    // 覆盖基类的 final_suspend()，为分离（detached）任务设置 is_detached_ 标志。
+    // 分离任务在 final_suspend 点不挂起，由运行时自动销毁帧。
+    // Override base final_suspend() to set is_detached_ for detached tasks.
+    constexpr task_final_awaiter<void> final_suspend() const noexcept {
+        task_final_awaiter<void> awaiter;
+        if (is_detached_flag == is_detached) {
+            awaiter.is_detached_ = true;
+        }
+        return awaiter;
+    }
 
     /*
      *  ┌──────────────────────────────────────┐

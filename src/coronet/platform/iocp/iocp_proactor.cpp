@@ -104,18 +104,75 @@ void iocp_proactor::deinit() noexcept {
         // 先发送一个特殊的退出信号（key=1, overlapped=nullptr）
         PostQueuedCompletionStatus(iocp_handle_, 0, 1, nullptr);
     }
-    // 排空 IOCP 队列中所有待处理的完成事件
-    // 循环读取直到没有更多事件（key=1 是退出信号，会跳过）
+    // 排空 IOCP 队列中所有待处理的完成事件。
+    //
+    // 竞态说明：
+    //   win_timeout / win_read / win_write 使用 detach 的后台线程执行阻塞操作
+    //   （Sleep / _read / _write），完成后通过 PostQueuedCompletionStatus 投递
+    //   完成事件。这些线程可能在 deinit() 排空队列期间投递新事件。
+    //
+    // 解决方案：首轮使用 timeout=0（非阻塞，零性能开销，与原实现一致）。
+    //   如果首轮排空了任何事件，说明有后台线程刚投递了完成事件，
+    //   此时做第二轮排空（timeout=0）即可捕获它们。
+    //   如果第二轮也排空了事件，说明仍有活跃的后台线程，再补一轮（timeout=1ms）。
+    //   总共最多增加 1ms 延迟，且仅在有后台线程活动时才触发。
+    //
+    // Drain all pending completions.
+    // After posting the quit signal, drain in passes:
+    //   Pass 1: timeout=0 (non-blocking, same as before — zero overhead)
+    //   Pass 2: timeout=0 (catch completions posted by background threads
+    //           during pass 1; still non-blocking)
+    //   Pass 3: timeout=1ms (last-resort catch for slow background threads)
+    //
+    // Since deinit() is a shutdown path (not a hot I/O path), the worst-case
+    // 1ms overhead is negligible and only occurs when background threads are
+    // still in flight.
     while (true) {
         DWORD bytes = 0;
         ULONG_PTR key = 0;
         OVERLAPPED* ov = nullptr;
         BOOL ok = GetQueuedCompletionStatus(iocp_handle_, &bytes, &key, &ov, 0);
         if (!ok && !ov) break;
-        if (key == 1 && !ov) continue;
+        if (key == 1 && !ov) continue;  // wakeup signal, skip
         if (ov) {
-            // 释放未完成的操作
-            std::unique_ptr<iocp_operation> op{iocp_operation::from_overlapped(ov)};
+            std::unique_ptr<iocp_operation> op{
+                iocp_operation::from_overlapped(ov)};
+        }
+    }
+    // 第二轮：timeout=0，捕获首轮期间后台线程投递的事件
+    // Pass 2: timeout=0, catch completions posted during pass 1
+    {
+        bool drained = false;
+        while (true) {
+            DWORD bytes = 0;
+            ULONG_PTR key = 0;
+            OVERLAPPED* ov = nullptr;
+            BOOL ok = GetQueuedCompletionStatus(
+                iocp_handle_, &bytes, &key, &ov, 0);
+            if (!ok && !ov) break;
+            if (key == 1 && !ov) continue;
+            if (ov) {
+                std::unique_ptr<iocp_operation> op{
+                    iocp_operation::from_overlapped(ov)};
+                drained = true;
+            }
+        }
+        // 第三轮：仅在前两轮都排空了事件时才执行（说明仍有后台线程活跃中）
+        // Pass 3: only if pass 2 drained something (slow background threads)
+        if (drained) {
+            while (true) {
+                DWORD bytes = 0;
+                ULONG_PTR key = 0;
+                OVERLAPPED* ov = nullptr;
+                BOOL ok = GetQueuedCompletionStatus(
+                    iocp_handle_, &bytes, &key, &ov, 1);
+                if (!ok && !ov) break;
+                if (key == 1 && !ov) continue;
+                if (ov) {
+                    std::unique_ptr<iocp_operation> op{
+                        iocp_operation::from_overlapped(ov)};
+                }
+            }
         }
     }
     if (iocp_handle_) {

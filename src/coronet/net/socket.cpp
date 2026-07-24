@@ -22,6 +22,9 @@ namespace coronet {
 socket& socket::bind(const inet_address& addr) {
     int ret = ::bind((int)sockfd_, addr.get_sockaddr(), addr.length());
     if (ret < 0) {
+        std::fprintf(stderr, "[FATAL] socket::bind fd=%d port=%d errno=%d: %s\n",
+                     (int)sockfd_, (int)ntohs(addr.port()), errno, strerror(errno));
+        std::fflush(stderr);
         std::perror("socket::bind");
         std::abort();
     }
@@ -35,6 +38,9 @@ socket& socket::bind(const inet_address& addr) {
 socket& socket::listen(int backlog) {
     int ret = ::listen((int)sockfd_, backlog);
     if (ret < 0) {
+        std::fprintf(stderr, "[FATAL] socket::listen fd=%d errno=%d: %s\n",
+                     (int)sockfd_, errno, strerror(errno));
+        std::fflush(stderr);
         std::perror("socket::listen");
         std::abort();
     }

@@ -50,7 +50,8 @@ public:
     redis_server(asio::io_context& io, uint16_t port)
         : io_(io), acceptor_(io, tcp::endpoint(tcp::v4(), port))
     {
-        std::printf("[ASIO] Redis echo server listening on port %d\n", port);
+        std::fprintf(stderr, "[ASIO MT] listening on port %d\n", port);
+        std::fflush(stderr);
         do_accept();
     }
 
@@ -70,6 +71,9 @@ private:
 };
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    _set_abort_behavior(0, _WRITE_ABORT_MSG);
+#endif
     uint16_t port = DefaultPort;
     if (argc > 1) port = static_cast<uint16_t>(std::atoi(argv[1]));
 

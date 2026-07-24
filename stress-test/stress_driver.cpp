@@ -82,27 +82,6 @@ static std::vector<Server> g_servers;
 // ============================================================
 // Helpers
 // ============================================================
-static bool has_redis_benchmark() {
-#ifdef _WIN32
-    auto pipe = popen_cmd("where redis-benchmark 2>nul");
-#else
-    auto pipe = popen_cmd("which redis-benchmark 2>/dev/null");
-#endif
-    if (!pipe) return false;
-    char buf[256]{};
-    return fgets(buf, sizeof(buf), pipe.handle()) && buf[0] != '\0';
-}
-
-static std::string run_cmd(const char* cmd) {
-    auto pipe = popen_cmd(cmd);
-    if (!pipe) return {};
-    std::string out;
-    char buf[1024];
-    while (fgets(buf, sizeof(buf), pipe.handle())) out += buf;
-    return out;
-}
-
-/// 获取当前可执行文件所在目录 / Get the directory containing the current executable
 static std::filesystem::path get_exe_dir() {
 #ifdef _WIN32
     char buf[MAX_PATH];
@@ -120,6 +99,75 @@ static std::filesystem::path get_exe_dir() {
 #endif
     return std::filesystem::current_path();
 }
+static bool has_redis_benchmark() {
+    // 1) 优先查找项目自带 redis tools (coronet/redistools/)
+    auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-benchmark";
+#ifdef _WIN32
+    redistools += ".exe";
+#endif
+    if (std::filesystem::exists(redistools)) return true;
+
+    // 2) 查找同目录
+    auto local = get_exe_dir() / "redis-benchmark";
+#ifdef _WIN32
+    local += ".exe";
+#endif
+    if (std::filesystem::exists(local)) return true;
+
+    // 3) 查找系统 PATH
+#ifdef _WIN32
+    auto pipe = popen_cmd("where redis-benchmark 2>nul");
+#else
+    auto pipe = popen_cmd("which redis-benchmark 2>/dev/null");
+#endif
+    if (!pipe) return false;
+    char buf[256]{};
+    return fgets(buf, sizeof(buf), pipe.handle()) && buf[0] != '\0';
+}
+
+static std::string find_redis_benchmark() {
+    // 返回 redis-benchmark 的完整路径
+    auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-benchmark";
+#ifdef _WIN32
+    redistools += ".exe";
+#endif
+    if (std::filesystem::exists(redistools)) return redistools.string();
+
+    auto local = get_exe_dir() / "redis-benchmark";
+#ifdef _WIN32
+    local += ".exe";
+#endif
+    if (std::filesystem::exists(local)) return local.string();
+
+    return "redis-benchmark";  // fallback: rely on PATH
+}
+
+static std::string find_redis_cli() {
+    auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-cli";
+#ifdef _WIN32
+    redistools += ".exe";
+#endif
+    if (std::filesystem::exists(redistools)) return redistools.string();
+
+    auto local = get_exe_dir() / "redis-cli";
+#ifdef _WIN32
+    local += ".exe";
+#endif
+    if (std::filesystem::exists(local)) return local.string();
+
+    return "redis-cli";
+}
+
+static std::string run_cmd(const char* cmd) {
+    auto pipe = popen_cmd(cmd);
+    if (!pipe) return {};
+    std::string out;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), pipe.handle())) out += buf;
+    return out;
+}
+
+/// 获取当前可执行文件所在目录 / Get the directory containing the current executable
 
 /// Parse --server "name:binary:base_port[:port_count]"
 static bool parse_server(std::string_view arg, Server& s) {
@@ -316,15 +364,10 @@ static void kill_sp(Subprocess* sp) {
 
 /// 等待服务端端口就绪 / Wait for server port to be ready
 static bool wait_ready(int port, int timeout_sec) {
+    auto cli = find_redis_cli();
     for (int i = 0; i < timeout_sec * 5; ++i) {
-        if (has_redis_benchmark()) {
-            auto cmd = std::format("redis-cli -p {} ping 2>/dev/null", port);
-            if (run_cmd(cmd.c_str()).find("PONG") != std::string::npos) return true;
-        } else {
-            // Without redis-cli, just wait fixed time
-            std::this_thread::sleep_for(std::chrono::seconds(timeout_sec));
-            return true;
-        }
+        auto cmd = std::format("\"{}\" -p {} ping 2>&1", cli, port);
+        if (run_cmd(cmd.c_str()).find("PONG") != std::string::npos) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     return false;
@@ -350,27 +393,9 @@ static LoadResult parse_bench_output(const std::string& out) {
 }
 
 static LoadResult run_redis_benchmark(int port) {
-    auto cmd = std::format("redis-benchmark -p {} -n {} -c {} -t ping -q 2>&1",
-                           port, g_requests, g_concurrency);
-    std::string out = run_cmd(cmd.c_str());
-    if (g_verbose) std::printf("%s", out.c_str());
-    return parse_bench_output(out);
-}
-
-static LoadResult run_loadgen(int port, int port_count) {
-    auto lg_path = get_exe_dir() / "redis_loadgen";
-#ifdef _WIN32
-    lg_path += ".exe";
-#endif
-    std::string port_arg;
-    if (port_count > 1)
-        port_arg = std::format("{}-{}", port, port + port_count - 1);
-    else
-        port_arg = std::to_string(port);
-
-    auto cmd = std::format("\"{}\" -p {} -n {} -c {} -P 1 -q 2>&1",
-                           lg_path.string(), port_arg,
-                           g_requests, g_concurrency);
+    auto rb = find_redis_benchmark();
+    auto cmd = std::format("\"{}\" -p {} -n {} -c {} -t ping -q 2>&1",
+                           rb, port, g_requests, g_concurrency);
     std::string out = run_cmd(cmd.c_str());
     if (g_verbose) std::printf("%s", out.c_str());
     return parse_bench_output(out);
@@ -383,7 +408,6 @@ struct TestResult {
     std::string name; int port;
     double rps = 0;
     bool   ok  = false;
-    bool   used_rb = false;   // true = redis-benchmark, false = redis_loadgen
     ResourceUsage res;
 };
 
@@ -395,15 +419,10 @@ static TestResult run_one(const Server& srv) {
     if (!spawn(&sp, srv.binary.c_str(), srv.port, srv.port_count)) { std::printf("SKIP\n"); return r; }
     if (!wait_ready(srv.port, 10)) { std::printf("FAIL (port not ready)\n"); kill_sp(&sp); return r; }
 
-    r.used_rb = has_redis_benchmark();
     Sampler sampler;
     sampler.start(sp.pid);
 
-    LoadResult lr;
-    if (r.used_rb)
-        lr = run_redis_benchmark(srv.port);
-    else
-        lr = run_loadgen(srv.port, srv.port_count);
+    LoadResult lr = run_redis_benchmark(srv.port);
 
     r.rps = lr.rps;
     r.ok  = lr.ok;
@@ -413,8 +432,6 @@ static TestResult run_one(const Server& srv) {
 
     if (r.ok) {
         std::printf("PASS  rps=%.0f", r.rps);
-        if (r.used_rb) std::printf("  [redis-benchmark]");
-        else           std::printf("  [redis_loadgen]");
         if (r.res.valid) std::printf("  cpu=%.1f%%  mem=%ldM", r.res.cpu_pct, r.res.mem_mb);
         std::printf("\n");
     } else { std::printf("FAIL\n"); }
@@ -443,13 +460,12 @@ static void csv(const std::vector<TestResult>& res) {
 
     std::ofstream f(fn);
     if (!f) return;
-    f << "Server,Port,RPS,CPU%,Mem_MB,Tool,Status\n";
+    f << "Server,Port,RPS,CPU%,Mem_MB,Status\n";
     for (auto& r : res) {
         f << r.name << ',' << r.port << ','
           << (r.ok ? r.rps : 0.0) << ','
           << (r.res.valid ? r.res.cpu_pct : 0.0) << ','
           << (r.res.valid ? r.res.mem_mb : 0L) << ','
-          << (r.used_rb ? "redis-benchmark" : "redis_loadgen") << ','
           << (r.ok ? "PASS" : "FAIL") << '\n';
     }
     std::printf("Data saved: %s\n", fn);
@@ -483,8 +499,6 @@ int main(int argc, char** argv) {
 
     std::printf("=== coronet Stress Driver ===\n");
     std::printf("Servers: %zu\n", g_servers.size());
-    bool has_rb = has_redis_benchmark();
-    std::printf("Tool:    %s\n", has_rb ? "redis-benchmark" : "redis_loadgen");
     std::printf("Load:    %d req x %d concurrent\n\n", g_requests, g_concurrency);
 
     std::vector<TestResult> results;

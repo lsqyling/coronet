@@ -115,9 +115,9 @@ private:
     condition_variable not_empty_cv_;  // 等待"不空"条件
 
     const T* buffer_start() const noexcept { return reinterpret_cast<const T*>(buf_.data()); }
-    const T* buffer_end()   const noexcept { return reinterpret_cast<const T*>(&(*buf_.end())); }
+    const T* buffer_end()   const noexcept { return reinterpret_cast<const T*>(buf_.data() + capacity); }
     T* buffer_start() noexcept { return reinterpret_cast<T*>(buf_.data()); }
-    T* buffer_end()   noexcept { return reinterpret_cast<T*>(&(*buf_.end())); }
+    T* buffer_end()   noexcept { return reinterpret_cast<T*>(buf_.data() + capacity); }
 
     // 出队：first_ 前进一位，到达末尾则绕回开头
     void pop_one() noexcept {

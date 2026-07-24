@@ -20,6 +20,12 @@
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(CORONET_PLATFORM_WINDOWS)
+#include "coronet/platform/iocp/iocp_win_io.hpp"  // win_chain_base for typed chain dispatch
+#else
+#include "coronet/platform/epoll/epoll_lazy_io.hpp"  // epoll_chain_base for typed chain dispatch
+#endif
+
 namespace coronet::detail {
 
 // ---- 生命周期 ----
@@ -166,6 +172,24 @@ void worker_meta::handle_completion(
     log::v("[worker] handle_completion: user_data=%llu result=%d reap=%u\n",
            (unsigned long long)info->user_data, info->result, requests_to_reap);
 
+    // 回收平台操作对象到线程本地空闲链表（ASIO 模式）。
+    // 必须在所有 early-return 之前执行，否则 chain_fn 路径和 null-handle
+    // 路径会泄漏 iocp_operation，导致 C1000K 压测时内存飙升至 256MB。
+    //
+    // Recycle the platform operation BEFORE any early-return paths.
+    // The chain_fn and null-handle paths must not leak iocp_operation
+    // objects — otherwise chained co_await (operator&&) will leak
+    // one operation per I/O pair, reaching 256MB at C1000K load.
+#if defined(CORONET_PLATFORM_WINDOWS)
+    if (info->opaque) {
+        auto* raw = static_cast<platform::iocp::iocp_operation*>(info->opaque);
+        platform::iocp::recycle_operation(
+            std::unique_ptr<platform::iocp::iocp_operation>{raw});
+    }
+#else
+    (void)info->opaque;
+#endif
+
     // 从 user_data 中解码 task_info 指针
     auto* ti = task_info::from_user_data(info->user_data);
     if (!ti) {
@@ -178,15 +202,28 @@ void worker_meta::handle_completion(
 
     // Chained co_await: first op completed → auto-start the second op
     // 链式 co_await 处理（operator&&）：
-    // 如果当前操作设置了 chain_fn，说明这是一个链式操作的第一环。
-    // 不恢复用户协程，而是调用 chain_fn 启动后续操作。
-    // 第二个操作完成时才会恢复用户协程。
-    if (ti->chain_fn && ti->chain_ctx) {
-        auto fn = ti->chain_fn;
-        auto* ctx = ti->chain_ctx;
-        ti->chain_fn = nullptr;
-        ti->chain_ctx = nullptr;
-        fn(ctx);  // start second I/O (its handle leads to user coroutine)
+    //   如果当前 ti 设置了 chain_target，说明是链式操作的第一环。
+    //   不恢复用户协程，而是调用第二个 awaiter 内置的 chain_dispatch_fn。
+    //   第二个操作完成时才会恢复用户协程。
+    //
+    //   分发函数指针存储在目标 awaiter 内部（per-type CRTP 静态函数），
+    //   编译器在 CRTP 实例化时已知完整 Derived 类型，可生成优化的调用。
+    //
+    // Chained co_await: first op completed → auto-start the second.
+    // Uses the target awaiter's built-in chain_dispatch_fn (set at CRTP
+    // instantiation time with complete type info) instead of a void*
+    // function pointer pair in task_info.
+    if (ti->chain_target) {
+#if defined(CORONET_PLATFORM_WINDOWS)
+        auto* target = static_cast<win_chain_base*>(ti->chain_target);
+        ti->chain_target = nullptr;
+        target->chain_issue_next();  // typed dispatch, complete type at compile time
+#else
+        // epoll path: use epoll_chain_base for typed dispatch
+        auto* target = static_cast<epoll_chain_base*>(ti->chain_target);
+        ti->chain_target = nullptr;
+        target->chain_issue_next();
+#endif
         return;
     }
 
@@ -203,17 +240,6 @@ void worker_meta::handle_completion(
     forward_task(ti->handle);
 
     ti->handle = nullptr;
-
-    // 回收平台操作对象：IOCP 使用线程本地空闲链表（ASIO 模式）
-    // Recycle the platform operation via unique_ptr (no raw delete)
-#if defined(CORONET_PLATFORM_WINDOWS)
-    if (info->opaque) {
-        auto* raw = static_cast<platform::iocp::iocp_operation*>(info->opaque);
-        platform::iocp::recycle_operation(std::unique_ptr<platform::iocp::iocp_operation>{raw});
-    }
-#else
-    (void)info->opaque;
-#endif
 }
 
 // 检查是否达到批量提交阈值。当前配置为 uint32_t(-1)（实际不启用阈值限制），
