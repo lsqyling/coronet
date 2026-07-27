@@ -6,11 +6,15 @@
 #include "coronet/detail/user_data.hpp"
 #include "coronet/platform/epoll/epoll_reactor.hpp"
 
-#include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <coroutine>
 #include <cstdint>
+#include <mutex>
+#include <queue>
 #include <span>
+#include <thread>
+#include <vector>
 
 #include <cerrno>
 #include <sys/socket.h>
@@ -19,14 +23,73 @@
 #include <thread>
 #include <unistd.h>
 
-// O_NONBLOCK (04000) | O_CLOEXEC (02000000) — avoid <fcntl.h> to prevent
-// struct stat from shadowing ::stat() in downstream translation units.
-// 使用硬编码的标志值而非包含 <fcntl.h>，避免 struct stat 与 ::stat() 冲突。
-// O_NONBLOCK = 04000（八进制），O_CLOEXEC = 02000000（八进制）
-// 这是 Linux 上避免头文件冲突的常见技巧。
-namespace {
-constexpr int kPipe2Flags = 04000 | 02000000;
-}
+// eventfd is used for file I/O completion signaling (replaces pipe2).
+// eventfd is lighter than pipe: single fd, kernel-internal counter.
+// EFD_NONBLOCK | EFD_CLOEXEC are defined in <sys/eventfd.h> (already included).
+// 使用 eventfd 替代 pipe2 进行文件 I/O 完成通知：单 fd，内核内部计数器，更轻量。
+
+// ============================================================
+// File I/O thread pool — reuses threads for epoll_read/epoll_write
+// ============================================================
+// 替代每个 I/O 操作用 std::thread().detach() 的方案。
+// 4 个工作线程（可配置），共享任务队列，避免大文件 I/O 时创建数千线程。
+//
+// Replaces per-op std::thread().detach() with a reusable thread pool.
+// 4 workers (configurable), shared queue — avoids thousands of threads
+// during large file I/O (e.g. 5GB file in 1MB chunks = 5000+ threads).
+// Simple function pointer + context for thread pool tasks (avoids std::function)
+struct file_io_task {
+    void (*fn)(void* ctx) noexcept;
+    void* ctx;
+};
+
+class file_io_pool {
+public:
+    // Leaky singleton: pool is never destroyed. Avoids use-after-free
+    // during static destruction — pool workers may still be executing
+    // when other statics are destroyed. OS reclaims resources on exit.
+    // 泄漏式单例：避免静态析构期间的 use-after-free。
+    static file_io_pool& instance() {
+        static auto* pool = new file_io_pool(4);
+        return *pool;
+    }
+
+    void submit(file_io_task task) noexcept {
+        {
+            std::lock_guard lock(mtx_);
+            queue_.push(task);
+        }
+        cv_.notify_one();
+    }
+
+private:
+    explicit file_io_pool(size_t num_threads) : stop_(false) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this]() {
+                while (true) {
+                    file_io_task task{nullptr, nullptr};
+                    {
+                        std::unique_lock lock(mtx_);
+                        cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
+                        if (stop_ && queue_.empty()) return;
+                        task = queue_.front();
+                        queue_.pop();
+                    }
+                    if (task.fn) task.fn(task.ctx);
+                }
+            });
+        }
+    }
+
+    // Destructor never runs (leaky singleton). Defined for completeness.
+    ~file_io_pool() = default;
+
+    std::vector<std::thread> workers_;
+    std::queue<file_io_task> queue_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool stop_;
+};
 
 namespace coronet::detail {
 
@@ -126,6 +189,9 @@ public:
     void refresh_user_data() noexcept {
         op_ctx_.user_data = io_info_.as_user_data()
             | uint64_t(user_data_type::task_info_ptr);
+        // Fix self pointer after move (chained_awaiter moves the awaiter
+        // into its storage, invalidating the old this pointer)
+        op_ctx_.self = static_cast<Derived*>(this);
     }
 
 protected:
@@ -357,9 +423,75 @@ private:
 };
 
 // ============================================================
-// File I/O — background thread (regular files not epollable)
+// UDP I/O: recvfrom / sendto
 // ============================================================
-// 文件 I/O — 后台线程（普通文件不支持 epoll）
+// UDP 数据报 I/O — 基于 epoll 就绪通知 + ::recvfrom / ::sendto syscall。
+// 与 TCP 的 recv/send 模式相同：epoll 通知 fd 可读/可写后执行实际 syscall。
+// recvfrom 额外通过 addr_storage_ 接收源地址。
+
+/// recvfrom 操作的返回类型 — 字节数 + 源地址。
+struct recvfrom_result {
+    int32_t bytes;
+    struct sockaddr_storage addr;
+};
+
+struct epoll_recvfrom final : epoll_awaiter_base<epoll_recvfrom> {
+    epoll_recvfrom(int fd, std::span<char> buf, int flags = 0) noexcept
+        : epoll_awaiter_base(fd, EPOLLIN), buf_(buf), flags_(flags)
+    {
+        op_ctx_.perform = &epoll_recvfrom::do_perform;
+    }
+
+    /// 覆盖基类的 await_resume — 返回 recvfrom_result 而非 int32_t。
+    [[nodiscard]] recvfrom_result await_resume() const noexcept {
+        return recvfrom_result{io_info_.result, addr_storage_};
+    }
+
+private:
+    std::span<char> buf_;
+    int flags_;
+    struct sockaddr_storage addr_storage_{};
+    socklen_t addr_len_ = sizeof(addr_storage_);
+
+    static int do_perform(int fd, void* self) noexcept {
+        auto* a = static_cast<epoll_recvfrom*>(self);
+        a->io_info_.result = sys_result(
+            ::recvfrom(fd, a->buf_.data(), a->buf_.size(), a->flags_,
+                       reinterpret_cast<struct sockaddr*>(&a->addr_storage_),
+                       &a->addr_len_));
+        return a->io_info_.result;
+    }
+};
+
+struct epoll_sendto final : epoll_awaiter_base<epoll_sendto> {
+    epoll_sendto(int fd, std::span<const char> buf,
+                 const struct sockaddr* addr, socklen_t addrlen,
+                 int flags = 0) noexcept
+        : epoll_awaiter_base(fd, EPOLLOUT), buf_(buf),
+          addr_(addr), addrlen_(addrlen), flags_(flags)
+    {
+        op_ctx_.perform = &epoll_sendto::do_perform;
+    }
+
+private:
+    std::span<const char> buf_;
+    const struct sockaddr* addr_;
+    socklen_t addrlen_;
+    int flags_;
+
+    static int do_perform(int fd, void* self) noexcept {
+        auto* a = static_cast<epoll_sendto*>(self);
+        a->io_info_.result = sys_result(
+            ::sendto(fd, a->buf_.data(), a->buf_.size(), a->flags_,
+                     a->addr_, a->addrlen_));
+        return a->io_info_.result;
+    }
+};
+
+// ============================================================
+// File I/O — thread pool + eventfd (regular files not epollable)
+// ============================================================
+// 文件 I/O — 线程池 + eventfd（普通文件不支持 epoll）
 //
 // 为什么普通文件不适用于 epoll？
 //   epoll 的底层机制是等待设备驱动报告文件描述符的状态变化。
@@ -368,21 +500,25 @@ private:
 //   因为文件的 read/write 永远不会阻塞（数据直接从内核页缓存读取）。
 //   这意味着 epoll_wait 在普通文件上会立即返回就绪事件，实际上退化为轮询。
 //
-// 解决方案：pipe + 后台线程
-//   - 后台线程执行实际的阻塞式文件 I/O（read/pread/write/pwrite）
-//   - I/O 完成后向 pipe 写入一个字节的信号
-//   - 前台线程将 pipe 的读端注册到 epoll，等待信号到来
-//   - epoll 检测到 pipe 可读时，从 io_info_ 中获取后台线程写入的结果
+// 解决方案：eventfd + 线程池（零堆分配）
+//   - 线程池执行实际的阻塞式文件 I/O（read/pread/write/pwrite）
+//   - I/O 完成后向 eventfd 写入一个 uint64_t 信号
+//   - 前台线程将 eventfd 注册到 epoll，等待信号到来
+//   - epoll 检测到 eventfd 可读时，从 io_info_ 中获取线程池写入的结果
+//
+// 与旧方案（pipe2 + new/delete）的改进：
+//   1. eventfd 替代 pipe2：单 fd，内核内部计数器，比 pipe 更轻量
+//   2. ctx 嵌入 awaiter：消除 new/delete 堆分配，上下文在协程帧上
+//   3. 与 IOCP 的 win_file_io_pool 设计对称
 //
 // CRTP 的 register_with_epoll() 覆盖：
 //   epoll_read 和 epoll_write 覆盖了 register_with_epoll() 方法。
 //   在覆盖的实现中：
-//     1. 创建 pipe2（O_NONBLOCK | O_CLOEXEC）
-//     2. 将当前 fd_ 替换为 pipe 读端
-//     3. 调用基类的 register_with_epoll() 将 pipe 读端注册到 epoll
-//     4. 启动后台线程执行文件 I/O
-//     5. 后台线程完成后向 pipe 写端写入信号
-//     6. 关闭 pipe 写端
+//     1. 创建 eventfd（EFD_NONBLOCK | EFD_CLOEXEC）
+//     2. 将当前 fd_ 替换为 event_fd_
+//     3. 调用基类的 register_with_epoll() 将 event_fd_ 注册到 epoll
+//     4. 提交文件 I/O 任务到线程池（ctx = this，零堆分配）
+//     5. 线程池 worker 完成后向 event_fd_ 写入信号
 
 struct epoll_read final : epoll_awaiter_base<epoll_read> {
     friend class epoll_awaiter_base<epoll_read>;
@@ -396,57 +532,52 @@ struct epoll_read final : epoll_awaiter_base<epoll_read> {
 private:
     std::span<char> buf_;
     uint64_t offset_;
-    int signal_fd_ = -1;
-    int pipe_rd_ = -1;
+    int file_fd_ = -1;    // original file fd (saved before fd_ → event_fd_)
+    int event_fd_ = -1;   // eventfd for completion signaling (replaces pipe2)
 
-    // Name-hiding override: create pipe + background thread, then call base
-    // name-hiding 覆盖：创建 pipe + 后台线程，然后调用基类的 register_with_epoll
+    // Name-hiding override: create eventfd + submit to thread pool, then call base
+    // name-hiding 覆盖：创建 eventfd + 提交到线程池，然后调用基类的 register_with_epoll
     void register_with_epoll() noexcept {
-        int file_fd = fd_;
-        int pipefd[2];
-        if (::pipe2(pipefd, kPipe2Flags) == 0) {
-            pipe_rd_ = pipefd[0];
-            signal_fd_ = pipefd[1];
-            fd_ = pipe_rd_;
+        file_fd_ = fd_;  // save original file fd before changing fd_ to event_fd_
+        event_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (event_fd_ >= 0) {
+            fd_ = event_fd_;
             op_ctx_.fd = fd_;
             epoll_events_ = EPOLLIN;
         }
-        // Call the default base implementation to register with epoll
-        // 调用基类的默认实现将 pipe 读端注册到 epoll
+        // Call the default base implementation to register event_fd_ with epoll
+        // 调用基类的默认实现将 event_fd_ 注册到 epoll
         epoll_awaiter_base::register_with_epoll();
 
-        auto buf_span = buf_;
-        auto off = offset_;
-        auto* ti = &io_info_;
-        int sig_fd = signal_fd_;
-
-        // 后台线程执行文件 I/O，完成后通过 pipe 发送信号
-        std::thread([file_fd, buf_span, off, ti, sig_fd]() {
+        // Context is `this` (awaiter on coroutine frame) — zero heap allocation.
+        // The awaiter is alive for the duration of the suspended coroutine, and
+        // the pool worker accesses it before signaling completion (which resumes
+        // the coroutine), so lifetime is safe.
+        // 上下文为 this（协程帧上的 awaiter）——零堆分配
+        file_io_pool::instance().submit({[](void* p) noexcept {
+            auto* a = static_cast<epoll_read*>(p);
             ssize_t n;
-            if (off == uint64_t(-1)) {
-                n = ::read(file_fd, buf_span.data(), buf_span.size());
-            } else {
-                n = ::pread(file_fd, buf_span.data(), buf_span.size(),
-                            static_cast<off_t>(off));
-            }
-            ti->result = (n >= 0) ? static_cast<int32_t>(n) : -errno;
-            uint8_t sig = 1;
-            ssize_t nw = ::write(sig_fd, &sig, 1);
-            // 向 pipe 写入信号字节，通知前台线程文件 I/O 已完成
+            if (a->offset_ == uint64_t(-1))
+                n = ::read(a->file_fd_, a->buf_.data(), a->buf_.size());
+            else
+                n = ::pread(a->file_fd_, a->buf_.data(), a->buf_.size(),
+                            static_cast<off_t>(a->offset_));
+            a->io_info_.result = (n >= 0) ? static_cast<int32_t>(n) : -errno;
+            uint64_t sig = 1;
+            ssize_t nw = ::write(a->event_fd_, &sig, sizeof(sig));
             (void)nw;
-            ::close(sig_fd);
-        }).detach();
+            // Do NOT close event_fd_ here — do_perform will read from it then close.
+        }, this});
     }
 
     static int do_perform(int fd, void* self) noexcept {
         auto* a = static_cast<epoll_read*>(self);
-        uint8_t dummy;
-        ssize_t nr = ::read(fd, &dummy, 1);
-        // 从 pipe 读取信号字节（实际结果已存储在 io_info_.result 中）
+        uint64_t dummy;
+        ssize_t nr = ::read(fd, &dummy, sizeof(dummy));
         (void)nr;
-        if (a->pipe_rd_ >= 0) {
-            ::close(a->pipe_rd_);
-            a->pipe_rd_ = -1;
+        if (a->event_fd_ >= 0) {
+            ::close(a->event_fd_);
+            a->event_fd_ = -1;
         }
         return a->io_info_.result;
     }
@@ -464,50 +595,44 @@ struct epoll_write final : epoll_awaiter_base<epoll_write> {
 private:
     std::span<const char> buf_;
     uint64_t offset_;
-    int signal_fd_ = -1;
-    int pipe_rd_ = -1;
+    int file_fd_ = -1;    // original file fd (saved before fd_ → event_fd_)
+    int event_fd_ = -1;   // eventfd for completion signaling (replaces pipe2)
 
     void register_with_epoll() noexcept {
-        int file_fd = fd_;
-        int pipefd[2];
-        if (::pipe2(pipefd, kPipe2Flags) == 0) {
-            pipe_rd_ = pipefd[0];
-            signal_fd_ = pipefd[1];
-            fd_ = pipe_rd_;
+        file_fd_ = fd_;
+        event_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (event_fd_ >= 0) {
+            fd_ = event_fd_;
             op_ctx_.fd = fd_;
             epoll_events_ = EPOLLIN;
         }
         epoll_awaiter_base::register_with_epoll();
 
-        auto buf_span = buf_;
-        auto off = offset_;
-        auto* ti = &io_info_;
-        int sig_fd = signal_fd_;
-
-        std::thread([file_fd, buf_span, off, ti, sig_fd]() {
+        // Context is `this` (awaiter on coroutine frame) — zero heap allocation.
+        // 上下文为 this（协程帧上的 awaiter）——零堆分配
+        file_io_pool::instance().submit({[](void* p) noexcept {
+            auto* a = static_cast<epoll_write*>(p);
             ssize_t n;
-            if (off == uint64_t(-1)) {
-                n = ::write(file_fd, buf_span.data(), buf_span.size());
-            } else {
-                n = ::pwrite(file_fd, buf_span.data(), buf_span.size(),
-                             static_cast<off_t>(off));
-            }
-            ti->result = (n >= 0) ? static_cast<int32_t>(n) : -errno;
-            uint8_t sig = 1;
-            ssize_t nw = ::write(sig_fd, &sig, 1);
+            if (a->offset_ == uint64_t(-1))
+                n = ::write(a->file_fd_, a->buf_.data(), a->buf_.size());
+            else
+                n = ::pwrite(a->file_fd_, a->buf_.data(), a->buf_.size(),
+                             static_cast<off_t>(a->offset_));
+            a->io_info_.result = (n >= 0) ? static_cast<int32_t>(n) : -errno;
+            uint64_t sig = 1;
+            ssize_t nw = ::write(a->event_fd_, &sig, sizeof(sig));
             (void)nw;
-            ::close(sig_fd);
-        }).detach();
+        }, this});
     }
 
     static int do_perform(int fd, void* self) noexcept {
         auto* a = static_cast<epoll_write*>(self);
-        uint8_t dummy;
-        ssize_t nr = ::read(fd, &dummy, 1);
+        uint64_t dummy;
+        ssize_t nr = ::read(fd, &dummy, sizeof(dummy));
         (void)nr;
-        if (a->pipe_rd_ >= 0) {
-            ::close(a->pipe_rd_);
-            a->pipe_rd_ = -1;
+        if (a->event_fd_ >= 0) {
+            ::close(a->event_fd_);
+            a->event_fd_ = -1;
         }
         return a->io_info_.result;
     }
@@ -615,6 +740,13 @@ inline auto make_close(int fd) noexcept
 
 inline auto make_shutdown(int fd, int how) noexcept
     { return epoll_shutdown{fd, how}; }
+
+inline auto make_recvfrom(int fd, std::span<char> buf, int flags) noexcept
+    { return epoll_recvfrom{fd, buf, flags}; }
+
+inline auto make_sendto(int fd, std::span<const char> buf,
+                        const struct sockaddr* a, socklen_t al, int fl) noexcept
+    { return epoll_sendto{fd, buf, a, al, fl}; }
 
 inline auto make_read(int fd, std::span<char> buf, uint64_t off) noexcept
     { return epoll_read{fd, buf, off}; }

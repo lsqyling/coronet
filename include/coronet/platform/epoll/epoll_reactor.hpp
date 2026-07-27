@@ -35,7 +35,6 @@
 //     这实际上保证了"一个 fd 在同一时刻只能有一个等待操作"，
 //     简化了并发模型，不需要额外的锁来保护 fd 状态。
 
-#include "coronet/config/io_context.hpp"
 #include "coronet/platform/platform.hpp"
 
 #include <sys/epoll.h>

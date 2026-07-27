@@ -21,19 +21,11 @@
 
 #include "coronet/config/io_context.hpp"
 #include "coronet/detail/worker_meta.hpp"
-#include "coronet/detail/thread_meta.hpp"
-#include "coronet/detail/io_context_meta.hpp"
 #include "coronet/task.hpp"
 
-// 平台特定 Proactor：编译期选择（零虚表分派）
-// Platform-specific proactor: compile-time selection (no virtual dispatch)
-#if defined(CORONET_PLATFORM_WINDOWS)
-#include "coronet/platform/iocp/iocp_proactor.hpp"
-#elif defined(CORONET_USE_IOURING)
-#include "coronet/platform/io_uring/io_uring_proactor.hpp"
-#else
-#include "coronet/platform/epoll/epoll_reactor.hpp"
-#endif
+// 平台 Proactor：通过桥接头集中选择（零虚表分派）
+// Platform proactor: selected via the proactor_selector bridge (no virtual dispatch)
+#include "coronet/platform/proactor_selector.hpp"
 
 #include <thread>
 #include <atomic>
@@ -47,14 +39,9 @@ namespace coronet {
 /// No virtual dispatch, no heap allocation for the proactor.
 class io_context final {
 public:
-    // 编译期平台 Proactor 类型选择 / Compile-time proactor type selection
-#if defined(CORONET_PLATFORM_WINDOWS)
-    using proactor_type = platform::iocp::iocp_proactor;
-#elif defined(CORONET_USE_IOURING)
-    using proactor_type = platform::io_uring::io_uring_proactor;
-#else
-    using proactor_type = platform::epoll::epoll_proactor;
-#endif
+    // 编译期平台 Proactor 类型（来自 proactor_selector 桥接）
+    // Compile-time proactor type (from the proactor_selector bridge)
+    using proactor_type = platform::proactor_type;
 
     io_context() noexcept;
     ~io_context() noexcept;
@@ -102,6 +89,7 @@ public:
 private:
     void deinit() noexcept;
     void run();                          // 事件循环主函数
+    void drain_residual_coroutines();   // P1-5: 关闭时排空残留协程
 
     void do_worker_part();               // 从 SPSC 环恢复就绪协程
     void do_submission_part() noexcept;  // 提交批量 I/O（仅 io_uring）
@@ -116,6 +104,11 @@ private:
     detail::worker_meta worker_;         // 调度器元数据
     std::thread host_thread_;            // 事件循环线程
     config::ctx_id_t id_;               // 上下文 ID
+    bool started_ = false;              // P0-3: start() 是否被调用过
+    // alignas: will_stop_ is written from other threads (can_stop()),
+    // must not share a cache line with hot event-loop data (proactor_, worker_).
+    // 缓存行隔离：will_stop_ 被其他线程写入（can_stop），不能与热数据共享缓存行。
+    alignas(config::cache_line_size)
     std::atomic<bool> will_stop_{false}; // 停止标志
 };
 
@@ -123,8 +116,11 @@ private:
 /// Free function: spawn a task on the current thread's io_context.
 void co_spawn(task<void>&& entrance) noexcept;
 
-/// 获取当前线程的 io_context 引用
-/// Get the current thread's io_context.
-io_context& this_io_context() noexcept;
+/// 获取当前线程的 io_context 指针。
+/// 返回 nullptr 表示当前线程不在 io_context 事件循环中。
+///
+/// Get the current thread's io_context pointer.
+/// Returns nullptr if not running inside an io_context event loop.
+io_context* this_io_context() noexcept;
 
 } // namespace coronet

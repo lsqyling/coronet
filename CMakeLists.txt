@@ -29,8 +29,10 @@ include(cmake/Option.cmake)         # Build options
 include(cmake/CompileOption.cmake)  # C++ standard, compiler flags, LTO
 include(cmake/Platform.cmake)       # Platform detection, link libraries
 include(cmake/Extra.cmake)          # External deps (liburingcxx, gtest, benchmark, mimalloc)
-include(cmake/Develop.cmake)        # Tests, examples, benchmarks
+include(cmake/CTest.cmake)          # CTest infrastructure (enable_testing, cleanup fixture)
+include(cmake/Develop.cmake)        # Sub-directories (tests, examples, benchmarks)
 include(cmake/Install.cmake)        # Install rules
+
 
 # ============================================================
 # Library sources

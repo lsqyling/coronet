@@ -1,7 +1,7 @@
 #include <coronet/coronet.hpp>
 #include <string_view>
 using namespace coronet;
-using Socket = coronet::socket;
+using Socket = coronet::tcp_socket;
 
 constexpr std::string_view hostname{"127.0.0.1"};
 constexpr uint16_t port = 9527;

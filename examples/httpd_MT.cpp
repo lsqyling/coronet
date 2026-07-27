@@ -196,7 +196,7 @@ void str_tolower(std::span<char> str) {
 }
 
 task<> session(const int sockfd) {
-    coronet::socket sock{sockfd};
+    coronet::tcp_socket sock{sockfd};
     defer _{[sockfd] {
         ::close(sockfd);
     }};
@@ -267,7 +267,7 @@ task<> session(const int sockfd) {
     );
 }
 
-task<> server(acceptor &ac, int id) {
+task<> server(tcp_acceptor &ac, int id) {
     log::i("ZeroHTTPd[%d] listening on port: %d\n", id, DEFAULT_SERVER_PORT);
 
     for (int sockfd; (sockfd = co_await ac.accept()) >= 0;) {
@@ -283,7 +283,7 @@ void sigint_handler([[maybe_unused]] int signo) {
 int main() {
     check_for_index_file();
 
-    acceptor ac{inet_address{DEFAULT_SERVER_PORT}};
+    tcp_acceptor ac{inet_address{DEFAULT_SERVER_PORT}};
 
     for (int i = 0; i < int(worker_num); ++i) {
         ctx[i].co_spawn(server(ac, i));

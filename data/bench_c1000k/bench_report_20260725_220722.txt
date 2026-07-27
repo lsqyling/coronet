@@ -1,0 +1,51 @@
+
+============================================================
+  Coronet vs ASIO C1000K Benchmark
+============================================================
+  Date:     07/25/2026 22:07:22
+  Requests: 1000000
+  Clients:  1000
+  Pipeline: 1 (no pipelining)
+  Build:    D:\dev\workspace\yidaoyun\coronet-win\buildmsvc-release
+  Report:   .\bench_report_20260725_220722.txt
+============================================================
+
+
+=== Round 1: Single-Threaded ===
+  coronet_ST [port 16500] starting...
+PASS  rps=51483  cpu=25%  mem=7MB  time=40.7s
+  coronet_chain [port 16501] starting...
+PASS  rps=50798  cpu=25.2%  mem=7MB  time=41.5s
+  ASIO_ST [port 16502] starting...
+PASS  rps=50909  cpu=26.2%  mem=7MB  time=41.2s
+
+=== Round 2: Multi-Threaded (6 threads) ===
+  coronet_MT(6) [port 16510] starting...
+PASS  rps=51091  cpu=24.4%  mem=8MB  time=41.2s
+  ASIO_MT(6) [port 16511] starting...
+PASS  rps=32674  cpu=59.4%  mem=7MB  time=63.4s
+
+============================================================
+  BENCHMARK SUMMARY
+============================================================
+  Duration:  3.9 minutes
+  Passed:    5 / 5
+  Avg RPS:   47391
+
+  Single-Threaded:
+    coronet_ST:     RPS=51483  CPU=25%  MEM=7MB
+    coronet_chain:  RPS=50798  CPU=25.2%  MEM=7MB
+    ASIO_ST:        RPS=50909  CPU=26.2%  MEM=7MB
+    coronet_ST vs ASIO: 1.1%
+
+  Multi-Threaded (6 threads):
+    coronet_MT(6):  RPS=51091  CPU=24.4%  MEM=8MB
+    ASIO_MT(6):     RPS=32674  CPU=59.4%  MEM=7MB
+    coronet_MT vs ASIO: 56.4%
+
+  Ports used: 16500, 16501, 16502, 16510, 16511
+
+  Report: .\bench_report_20260725_220722.txt
+  CSV:    .\bench_report_20260725_220722.csv
+============================================================
+

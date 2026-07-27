@@ -63,10 +63,29 @@ io_context::io_context() noexcept {
     log::d("[io_context] constructor done\n");
 }
 
-// 析构时自动停止事件循环并等待线程退出
+// 析构时自动停止事件循环并等待线程退出。
+// P0-3: 递减 create_count 和 ready_count，防止阶段性创建/销毁 io_context 时屏障死锁。
+// create_count 在构造时递增，ready_count 在 start() 时递增。
+// 两者都必须在析构时递减，否则：
+//   - create_count 不递减 → 阶段性创建死锁
+//   - ready_count 不递减 → 屏障过早通过（stale ready_count 使新 io_context 跳过等待）
 io_context::~io_context() noexcept {
     can_stop();
     join();
+    // 仅当 start() 曾被调用时才递减 ready_count
+    if (started_) {
+        detail::g_io_context_meta.ready_count.fetch_sub(
+            1, std::memory_order_release);
+    }
+    // 递减 create_count
+    auto old = detail::g_io_context_meta.create_count.fetch_sub(
+        1, std::memory_order_release);
+    // 递减后如果 create_count <= ready_count，屏障条件已满足，
+    // 唤醒所有在 wait_all_ready 中阻塞的线程。
+    if (old - 1 <= detail::g_io_context_meta.ready_count.load(
+            std::memory_order_acquire)) {
+        detail::g_io_context_meta.ready_count.notify_all();
+    }
 }
 
 // 清理 Proactor 资源（由 run() 在事件循环退出后调用）
@@ -79,9 +98,12 @@ void io_context::deinit() noexcept {
 // 启动事件循环线程。start() 非阻塞，立即返回。
 void io_context::start() {
     log::d("[io_context] start() — spawning thread\n");
+    started_ = true;
     // 标记自己已就绪（屏障的一部分）
     detail::g_io_context_meta.ready_count.fetch_add(1,
         std::memory_order_release);
+    // C++20: notify any thread waiting in wait_all_ready()
+    detail::g_io_context_meta.ready_count.notify_all();
     // 启动独立线程运行事件循环
     host_thread_ = std::thread(&io_context::run, this);
 }
@@ -123,10 +145,16 @@ void io_context::run() {
 
     // 事件循环：依次执行四个阶段
     uint64_t loop_count = 0;
-    while (!will_stop_.load(std::memory_order_relaxed)) [[likely]] {
+    // P1-1: acquire 确保与 can_stop() 中的 store(seq_cst) 建立 happens-before。
+    // x86 上 acquire load 编译为普通 mov（零开销），ARM 上加 dmb ishld（可忽略）。
+    while (!will_stop_.load(std::memory_order_acquire)) [[likely]] {
         loop_count++;
-        if (loop_count <= 5 || loop_count % 1000 == 0) {
-            log::v("[io_context] loop #%llu\n", (unsigned long long)loop_count);
+        // P2-1: 用 & 1023 替代 % 1000（位运算零开销），并用 if constexpr
+        // 在编译期消除日志（生产环境 level=warning 时整个分支被删除）。
+        if constexpr (config::level <= config::log_level::verbose) {
+            if (loop_count <= 5 || (loop_count & 1023) == 0) {
+                log::v("[io_context] loop #%llu\n", (unsigned long long)loop_count);
+            }
         }
         // 阶段 0：从跨线程队列搬移协程句柄到 SPSC 环（必须先做，确保新任务能被调度到）
         worker_.drain_cross_thread();
@@ -140,12 +168,43 @@ void io_context::run() {
 
     log::i("[io_context] run() — loop exited after %llu iterations\n",
            (unsigned long long)loop_count);
+
+    // P1-5: Drain phase — 恢复所有残留协程，避免帧泄漏。
+    // SPSC 环和 cross_queue 中残留的 detached 协程如果不恢复，其协程帧永远不会销毁。
+    // 非 detached 协程的父协程 co_await 会永远不返回 → 死锁。
+    // drain 阶段恢复它们，让协程有机会清理资源或快速失败。
+    drain_residual_coroutines();
+
     deinit();
     // 清理线程局部存储（将不再有效）
     detail::this_thread = {};
 }
 
 // ---- 四个事件循环阶段 ----
+
+// P1-5: 关闭时排空残留协程。
+// 事件循环退出后，SPSC 环和 cross_queue 中可能还有未恢复的协程句柄。
+// 对于 detached task<void>，不恢复会导致协程帧泄漏。
+// 对于非 detached task，父协程的 co_await 永远不返回 → 死锁。
+// 此方法在 deinit() 前执行有限轮次的排空，恢复所有残留协程。
+// 恢复的协程如果发起新 I/O，可能因 proactor 即将关闭而失败（通过异常或错误码处理）。
+void io_context::drain_residual_coroutines() {
+    // 首先排空跨线程队列
+    worker_.drain_cross_thread();
+    worker_.work_once();  // 恢复一个就绪协程（触发级联恢复）
+
+    // 有限轮次排空：防止恶意协程无限生成新任务导致无限循环
+    // 每轮 drain_cross_thread + do_worker_part，最多 3 轮
+    for (int round = 0; round < 3 && worker_.has_task_ready(); ++round) {
+        worker_.drain_cross_thread();
+        do_worker_part();
+    }
+
+    // 最终检查：如果仍有残留（理论上不应该），记录警告
+    if (worker_.has_task_ready()) {
+        log::w("[io_context] residual coroutines remain after drain phase\n");
+    }
+}
 
 // 阶段 1：消耗 SPSC 环中所有就绪的协程句柄，逐个恢复执行
 void io_context::do_worker_part() {
@@ -175,17 +234,24 @@ void io_context::do_completion_part() noexcept {
 
 // ---- 自由函数（方便的全局接口） ----
 
-// 向"当前线程"的 io_context 提交协程任务
+// 向"当前线程"的 io_context 提交协程任务。
+// P1-4: 如果在非 io_context 线程调用（ctx == null），记录警告而非静默丢弃。
+// entrance 析构时会安全销毁协程帧。
 void co_spawn(task<void>&& entrance) noexcept {
     auto ctx = detail::this_thread.ctx;
-    if (ctx) {
+    if (ctx) [[likely]] {
         ctx->co_spawn(std::move(entrance));
+    } else {
+        log::w("[co_spawn] called from non-io_context thread, task dropped\n");
+        // entrance 析构时安全销毁协程帧
     }
 }
 
-// 获取当前线程的 io_context 引用
-io_context& this_io_context() noexcept {
-    return *detail::this_thread.ctx;
+// 获取当前线程的 io_context 指针。
+// 返回 nullptr 表示当前线程不在 io_context 事件循环中（如 main 线程）。
+// 旧版本返回引用并解引用可能为 null 的指针 → UB。
+io_context* this_io_context() noexcept {
+    return detail::this_thread.ctx;
 }
 
 } // namespace coronet

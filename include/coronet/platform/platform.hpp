@@ -2,18 +2,28 @@
 // ============================================================
 // platform.hpp — 平台检测 + 跨平台类型定义
 // ============================================================
-// 统一抽象层：屏蔽 Windows/Linux 差异。
+// 统一抽象层：屏蔽 Windows/Linux/HarmonyOS 差异。
 //   - CORONET_PLATFORM_WINDOWS / CORONET_PLATFORM_LINUX：平台宏
 //   - socket_handle_t / file_handle_t：平台句柄类型别名
 //   - completion_info：跨平台 I/O 完成结果结构体
+//
+// Supported platforms:
+//   - Windows (IOCP)
+//   - Linux (epoll / io_uring)
+//   - HarmonyOS / OHOS (epoll — Linux kernel)
+// macOS is not yet supported (kqueue proactor needed).
 
 // ---- 平台检测 / Platform detection ----
 #if defined(_WIN32) || defined(_WIN64)
     #define CORONET_PLATFORM_WINDOWS 1
 #elif defined(__linux__)
+    // Linux and HarmonyOS (OHOS) both define __linux__ because HarmonyOS NEXT
+    // uses the Linux kernel.  epoll / eventfd / timerfd are all available.
     #define CORONET_PLATFORM_LINUX 1
+#elif defined(__APPLE__) && defined(__MACH__)
+    #error "coronet: macOS is not yet supported. A kqueue proactor is needed."
 #else
-    #error "coronet: unsupported platform (only Windows and Linux are supported)"
+    #error "coronet: unsupported platform. Supported: Windows (IOCP), Linux/HarmonyOS (epoll / io_uring)."
 #endif
 
 // ---- 编译器检测 / Compiler detection (for attributes) ----

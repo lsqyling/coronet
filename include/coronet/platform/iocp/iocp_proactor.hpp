@@ -73,8 +73,8 @@ public:
         return InterlockedCompareExchange(&ready_, 1, 0) != 0;
     }
 
-    void on_pending(struct iocp_proactor* proactor);
-    void on_sync_completion(struct iocp_proactor* proactor, DWORD bytes);
+    void on_pending(HANDLE iocp) noexcept;
+    void on_sync_completion(HANDLE iocp, DWORD bytes) noexcept;
 
     static iocp_operation* from_overlapped(OVERLAPPED* ov) noexcept {
         return static_cast<iocp_operation*>(ov);
@@ -91,13 +91,19 @@ public:
         ::new (static_cast<OVERLAPPED*>(this)) OVERLAPPED{};
         user_data_ = 0;
         ready_ = 0;
+        free_next_ = nullptr;  // P1-3: 清除空闲链表指针
     }
 
 private:
     friend class iocp_proactor;
+    friend void recycle_operation(std::unique_ptr<iocp_operation>) noexcept;
     uint64_t user_data_ = 0;
     std::coroutine_handle<> awaiting_handle_;
     volatile LONG ready_ = 0;
+    // P1-3: 专用空闲链表指针，替代复用 OVERLAPPED::Internal 字段。
+    // Internal 在正常 I/O 中用于存储 NTSTATUS，复用它在 double-free/use-after-free
+    // 时会静默损坏链表。专用成员使问题变为可检测的崩溃而非静默腐败。
+    iocp_operation* free_next_ = nullptr;
 };
 
 // ============================================================
@@ -165,7 +171,7 @@ public:
         void (*callback_fn)(void*, const completion_info*)) noexcept;
 
 private:
-    void* iocp_handle_ = nullptr;  // HANDLE
+    HANDLE iocp_handle_ = nullptr;
     uint32_t entries_ = 0;
     std::atomic<int64_t> outstanding_work_{0};
     // outstanding_work_ 跟踪飞行中的操作数量：

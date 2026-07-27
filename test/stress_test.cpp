@@ -46,10 +46,10 @@ constexpr int BufSize = 4096;
  *
  * 从 socket 读取数据，然后将相同的数据原样写回。这是最基本的 echo 服务逻辑。
  * recv 返回 ≤0 表示连接关闭或出错，此时退出循环结束会话。
- * 使用 coronet::socket 的协程版本 recv/send，通过 io_uring 完成异步 I/O。
+ * 使用 coronet::tcp_socket 的协程版本 recv/send，通过 io_uring 完成异步 I/O。
  */
 coronet::task<> echo_session(int sockfd) {
-    coronet::socket sock{sockfd};
+    coronet::tcp_socket sock{sockfd};
     char buf[BufSize];
     while (true) {
         int nr = co_await sock.recv(buf);
@@ -67,7 +67,7 @@ coronet::task<> echo_session(int sockfd) {
  * 这种方式使得每个客户端连接都由独立的协程处理，实现了并发。
  */
 coronet::task<> echo_server() {
-    coronet::acceptor ac{coronet::inet_address{TestPort}};
+    coronet::tcp_acceptor ac{coronet::inet_address{TestPort}};
     std::printf("[server] listening on port %d\n", TestPort);
     while (true) {
         int sock = co_await ac.accept();

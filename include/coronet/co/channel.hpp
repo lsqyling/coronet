@@ -201,6 +201,14 @@ class channel<T, 0> {
 public:
     channel() = default;
 
+    // P2-1 fix: 析构时销毁缓冲区中可能存在的 T（如果 released_ 为 true）。
+    // 旧实现用 T stored_{}（自动析构），改用 uninitialized_buffer 后需手动管理。
+    ~channel() {
+        if (released_.load(std::memory_order_relaxed)) {
+            stored_buf_.destroy();
+        }
+    }
+
     [[nodiscard]] constexpr size_t size() const noexcept { return 0; }
     [[nodiscard]] constexpr bool empty() const noexcept { return true; }
     [[nodiscard]] constexpr bool full() const noexcept { return false; }
@@ -210,11 +218,15 @@ public:
     /// Receive data — in rendezvous mode, wait for a sender.
     task<T> acquire() {
         co_await mtx_.lock();
-        if (!released_) {
-            co_await release_cv_.wait(mtx_, [this] { return released_; });
+        if (!released_.load(std::memory_order_relaxed)) {
+            co_await release_cv_.wait(mtx_, [this] {
+                return released_.load(std::memory_order_relaxed);
+            });
         }
-        T item{std::move(stored_)};
-        released_ = false;
+        // P2-1 fix: 从 uninitialized_buffer 移出数据，然后销毁
+        T item{std::move(stored_buf_.ref())};
+        stored_buf_.destroy();
+        released_.store(false, std::memory_order_release);
         mtx_.unlock();
         acquired_cv_.notify_one();
         co_return std::move(item);
@@ -226,20 +238,25 @@ public:
     template<typename... Args>
     task<> release(Args&&... args) {
         co_await mtx_.lock();
-        stored_ = T(std::forward<Args>(args)...);
-        released_ = true;
+        // P2-1 fix: 用 construct 替代赋值（uninitialized_buffer 不需要 T 可赋值）
+        stored_buf_.construct(std::forward<Args>(args)...);
+        released_.store(true, std::memory_order_release);
         mtx_.unlock();
         release_cv_.notify_one();
 
-        // 等待接收者取走数据
-        if (released_) {
-            co_await acquired_cv_.wait(mtx_, [this] { return !released_; });
+        if (released_.load(std::memory_order_acquire)) {
+            co_await acquired_cv_.wait(mtx_, [this] {
+                return !released_.load(std::memory_order_relaxed);
+            });
         }
     }
 
 private:
-    T stored_{};                     // 临时存储数据（仅在 rendezvous 期间有效）
-    bool released_ = false;          // 发送者已完成放置
+    // P2-1 fix: 使用 uninitialized_buffer 替代 T stored_{}
+    // 消除对 T 的 default-constructible 和 assignable 要求，
+    // 与 N-slot 和 single-slot 特化保持一致（仅要求 move_constructible）。
+    detail::uninitialized_buffer<T> stored_buf_;
+    std::atomic<bool> released_{false};  // 发送者已完成放置（atomic：release() 在 unlock 后读取）
     mutex mtx_;
     condition_variable release_cv_;  // 等待发送者信号
     condition_variable acquired_cv_; // 等待接收者确认

@@ -193,7 +193,7 @@ void str_tolower(std::span<char> str) {
 }
 
 task<> session(const int sockfd) {
-    coronet::socket sock{sockfd};
+    coronet::tcp_socket sock{sockfd};
     defer _{[sockfd] {
         ::close(sockfd);
     }};
@@ -265,7 +265,7 @@ task<> session(const int sockfd) {
 }
 
 task<> server(const uint16_t port) {
-    acceptor ac{inet_address{port}};
+    tcp_acceptor ac{inet_address{port}};
     printf("ZeroHTTPd listening on port: %d\n", DEFAULT_SERVER_PORT);
 
     for (int sockfd; (sockfd = co_await ac.accept()) >= 0;) {

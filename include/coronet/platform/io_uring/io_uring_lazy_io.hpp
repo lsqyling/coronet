@@ -11,7 +11,6 @@
 #include "coronet/detail/user_data.hpp"
 #include "coronet/platform/io_uring/io_uring_proactor.hpp"
 
-#include <cassert>
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
@@ -46,9 +45,6 @@ public:
 
     void await_suspend(std::coroutine_handle<> current) noexcept {
         io_info_.handle = current;
-        // await_suspend 只保存协程 handle，不涉及 syscall。
-        // I/O 请求已经在构造函数中通过 SQE 准备好，后续由 submit() 批量提交。
-        // 这种"构造时准备、统一提交"的模式减少了用户态/内核态切换次数。
     }
 
     [[nodiscard]] int32_t await_resume() const noexcept { return result(); }
@@ -56,10 +52,24 @@ public:
         return sqe_->get_data();
     }
 
-    // Public for chained co_await
-    // 公开给 chained_awaiter（operator&&）使用，用于链式 co_await
-    void do_issue_io() noexcept {}  // io_uring: SQE already prepared
-    // io_uring 的 SQE 已在构造函数中准备好，do_issue_io 为空操作
+    /// Skip CQE — fire-and-forget, coroutine not resumed.
+    /// 跳过 CQE — 协程不会被恢复，用于不需要等待的 fire-and-forget 操作。
+    std::suspend_never detach() && noexcept {
+        sqe_->set_cqe_skip();
+        --this_thread.worker->requests_to_reap;
+        return {};
+    }
+
+    // Non-copyable, non-movable — aligned with co_context lazy_awaiter.
+    // SQE pointer stays valid for the lifetime of the awaiter.
+    // 不可拷贝、不可移动（对齐 co_context lazy_awaiter）
+    io_uring_awaiter(const io_uring_awaiter&) = delete;
+    io_uring_awaiter(io_uring_awaiter&&) = delete;
+    io_uring_awaiter& operator=(const io_uring_awaiter&) = delete;
+    io_uring_awaiter& operator=(io_uring_awaiter&&) = delete;
+
+    // Concept requirements (io_awaitable / uring_awaitable)
+    void do_issue_io() noexcept {}
     void refresh_user_data() noexcept {
         sqe_->set_data(io_info_.as_user_data() | uint64_t(user_data_type::task_info_ptr));
     }
@@ -68,21 +78,16 @@ protected:
     io_uring_awaiter() noexcept {
         auto* p = static_cast<platform::io_uring::io_uring_proactor*>(
             this_thread.worker->proactor);
-        // 直接从 proactor 获取 SQE，零堆分配
         sqe_ = p->get_sq_entry();
         sqe_->set_data(
             io_info_.as_user_data()
             | uint64_t(detail::user_data_type::task_info_ptr));
-        // Track the inflight operation count
-        // 追踪飞行中的操作计数
         ++this_thread.worker->requests_to_reap;
         ++this_thread.worker->requests_to_submit;
     }
 
 public:
     liburingcxx::sq_entry* sqe_ = nullptr;
-    // Public: accessed by chained_awaiter (operator&&)
-    // 公开成员，供 chained_awaiter（operator&&）访问
     task_info io_info_;
 };
 
@@ -123,6 +128,67 @@ struct io_uring_close : io_uring_awaiter {
 struct io_uring_shutdown : io_uring_awaiter {
     io_uring_shutdown(int fd, int how) noexcept
         : io_uring_awaiter() { sqe_->prep_shutdown(fd, how); }
+};
+
+// ============================================================
+// UDP I/O: recvfrom / sendto via recvmsg / sendmsg
+// ============================================================
+// UDP 数据报 I/O — 使用 IORING_OP_RECVMSG / IORING_OP_SENDMSG。
+// recvmsg/sendmsg 通过 struct msghdr 传递 sockaddr，一次系统调用
+// 同时完成数据收发和地址获取/指定。
+//
+// msghdr 成员 msg_name / msg_namelen 用于存储/指定对端地址。
+// msg_iov / msg_iovlen 用于 scatter/gather 缓冲区（此处只用 1 个 iovec）。
+//
+// 注意：iov_、msg_、addr_storage_ 必须是 awaiter 的成员变量，
+// 因为 SQE 存储的是指向 msg_ 的指针，内核在完成 I/O 时才写入 addr_storage_。
+
+/// recvfrom 操作的返回类型 — 字节数 + 源地址。
+struct recvfrom_result {
+    int32_t bytes;
+    struct sockaddr_storage addr;
+};
+
+struct io_uring_recvfrom : io_uring_awaiter {
+    io_uring_recvfrom(int fd, std::span<char> buf, int flags = 0) noexcept
+        : io_uring_awaiter() {
+        iov_.iov_base = buf.data();
+        iov_.iov_len = buf.size();
+        msg_.msg_name = &addr_storage_;
+        msg_.msg_namelen = sizeof(addr_storage_);
+        msg_.msg_iov = &iov_;
+        msg_.msg_iovlen = 1;
+        sqe_->prep_recvmsg(fd, &msg_, flags);
+    }
+
+    /// 覆盖基类的 await_resume — 返回 recvfrom_result 而非 int32_t。
+    [[nodiscard]] recvfrom_result await_resume() const noexcept {
+        return recvfrom_result{io_info_.result, addr_storage_};
+    }
+
+private:
+    struct iovec iov_{};
+    struct msghdr msg_{};
+    struct sockaddr_storage addr_storage_{};
+};
+
+struct io_uring_sendto : io_uring_awaiter {
+    io_uring_sendto(int fd, std::span<const char> buf,
+                    const struct sockaddr* addr, socklen_t addrlen,
+                    int flags = 0) noexcept
+        : io_uring_awaiter() {
+        iov_.iov_base = const_cast<char*>(buf.data());
+        iov_.iov_len = buf.size();
+        msg_.msg_name = const_cast<struct sockaddr*>(addr);
+        msg_.msg_namelen = addrlen;
+        msg_.msg_iov = &iov_;
+        msg_.msg_iovlen = 1;
+        sqe_->prep_sendmsg(fd, &msg_, flags);
+    }
+
+private:
+    struct iovec iov_{};
+    struct msghdr msg_{};
 };
 
 // ============================================================
@@ -206,6 +272,11 @@ namespace coronet::detail::platform_io {
         { return io_uring_close{fd}; }
     inline auto make_shutdown(int fd, int how) noexcept
         { return io_uring_shutdown{fd, how}; }
+    inline auto make_recvfrom(int fd, std::span<char> buf, int flags) noexcept
+        { return io_uring_recvfrom{fd, buf, flags}; }
+    inline auto make_sendto(int fd, std::span<const char> buf,
+                            const struct sockaddr* a, socklen_t al, int fl) noexcept
+        { return io_uring_sendto{fd, buf, a, al, fl}; }
     inline auto make_read(int fd, std::span<char> buf, uint64_t off) noexcept
         { return io_uring_read{fd, buf, off}; }
     inline auto make_write(int fd, std::span<const char> buf, uint64_t off) noexcept

@@ -2,6 +2,7 @@
 # Build options for coronet
 # ============================================================
 
+option(CORONET_WITH_TLS "Enable TLS support (requires OpenSSL)" ON)
 option(CORONET_USE_MIMALLOC "Use mimalloc as default allocator" OFF)
 option(CORONET_IOURING "Use io_uring instead of epoll on Linux" OFF)
 option(CORONET_BUILD_TESTS "Build unit tests (gtest)" OFF)

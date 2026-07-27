@@ -23,7 +23,6 @@
 #include <coronet/io_context.hpp>
 #include <coronet/task.hpp>
 #include <coronet/shared_task.hpp>
-#include <coronet/async_io.hpp>
 #include <coronet/detail/uninitialized_buffer.hpp>
 
 #include <atomic>
@@ -55,8 +54,14 @@ namespace detail {
 // 这避免了默认构造 T 的开销 —— buffer 直到结果就绪才构造。
 //
 // ResultTuple: all non-void result types as tuple
+//
+// alignas(cache_line_size): when_all_state is heap-allocated via make_shared.
+// Without alignment, the atomic `remaining` counter may share a cache line
+// with the shared_ptr control block's reference count, causing false sharing
+// between child tasks (which do fetch_sub on remaining) and shared_ptr
+// ref-count operations.
 template<typename ResultTuple>
-struct when_all_state {
+struct alignas(config::cache_line_size) when_all_state {
     std::atomic<uint32_t> remaining;     // 剩余未完成任务数（原子倒计数）
     std::coroutine_handle<> awaiting{nullptr};  // 调用者协程句柄
 
@@ -103,6 +108,32 @@ task<void> all_run_one(Node node, std::shared_ptr<State> st) {
         co_await std::move(node);
     }
     st->count_down();
+}
+
+// ============================================================
+// when_all (all-void case): lightweight shared state + countdown
+// ============================================================
+// 当所有任务返回 void 时的轻量共享状态（无结果存储开销）。
+// 独立定义为 detail 命名空间的 struct，使得 all_run_void 可以引用它。
+// 当所有任务返回 void 时的轻量共享状态（无结果存储开销）。
+// 独立定义为 detail 命名空间的 struct，使得 all_run_void 可以引用它。
+// P2-2 fix: 添加 alignas(cache_line_size)，与 when_all_state 一致。
+// 防止 remaining 原子计数器与 shared_ptr 控制块引用计数共享缓存行（false sharing）。
+struct alignas(config::cache_line_size) all_void_state {
+    std::atomic<uint32_t> remaining;
+    std::coroutine_handle<> awaiting{nullptr};
+    explicit all_void_state(uint32_t n) : remaining(n) {}
+};
+
+/// 执行单个 void 子任务，完成后递减计数器，最后一个恢复调用者。
+///
+/// Coroutine function (not lambda) — avoids GCC LTO coroutine frame corruption
+/// when captures are involved (see project convention: "协程函数，不用协程 lambda").
+template<typename T>
+task<void> all_run_void(T t, std::shared_ptr<all_void_state> s) {
+    co_await std::move(t);
+    if (s->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        s->awaiting.resume();
 }
 
 // ============================================================
@@ -227,24 +258,19 @@ all(TaskTypes... tasks) {
 
     if constexpr (std::is_same_v<result_t, std::tuple<>>) {
         // All void: just countdown
-        struct void_state { std::atomic<uint32_t> rem; std::coroutine_handle<> h{nullptr}; };
-        auto st = std::make_shared<void_state>(N);
-        auto run_void = [](auto t, std::shared_ptr<void_state> s) -> task<void> {
-            co_await std::move(t);
-            if (s->rem.fetch_sub(1) == 1) s->h.resume();
-        };
+        auto st = std::make_shared<detail::all_void_state>(N);
         auto spawn = [&]<size_t... Idx>(std::index_sequence<Idx...>) {
-            (co_spawn(run_void(static_cast<TaskTypes&&>(tasks), st)), ...);
+            (co_spawn(detail::all_run_void(static_cast<TaskTypes&&>(tasks), st)), ...);
         };
         spawn(std::index_sequence_for<TaskTypes...>{});
         struct awaiter {
-            std::shared_ptr<void_state> s;
+            std::shared_ptr<detail::all_void_state> s;
             bool await_ready() const noexcept { return false; }
-            void await_suspend(std::coroutine_handle<> h) noexcept { s->h = h; }
+            void await_suspend(std::coroutine_handle<> h) noexcept { s->awaiting = h; }
             void await_resume() const noexcept {}
         };
         co_await awaiter{st};
-        co_return;
+        co_return result_t{};  // result_t = std::tuple<>, triggers return_value
     } else {
         using state_t = detail::when_all_state<result_t>;
         auto st = std::make_shared<state_t>(N);

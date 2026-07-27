@@ -11,5 +11,5 @@ set(coronet_micro_benchmarks
 foreach(bench_target ${coronet_micro_benchmarks})
     add_executable(${bench_target} ${bench_target}.cpp)
     target_link_libraries(${bench_target} PRIVATE coronet::coronet benchmark::benchmark benchmark::benchmark_main)
-    add_test(NAME ${bench_target} COMMAND $<TARGET_FILE:${bench_target}>)
+    coronet_add_test(${bench_target} COMMAND $<TARGET_FILE:${bench_target}>)
 endforeach()

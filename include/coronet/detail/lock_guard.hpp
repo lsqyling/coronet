@@ -1,8 +1,17 @@
 #pragma once
 
+#include <concepts>
 #include <type_traits>
 
 namespace coronet::detail {
+
+/// Concept: type with an unlock() method (for lock_guard).
+/// Unlike std::lockable, does not require lock() or try_lock() —
+/// lock_guard is constructed after the lock is already acquired.
+template<typename T>
+concept unlockable = requires(T& t) {
+    t.unlock();
+};
 
 /*
  * RAII 锁守卫 —— 对任何有 unlock() 方法的锁类型进行 RAII 封装。
@@ -36,6 +45,8 @@ template<typename Lockable>
 class lock_guard {
     static_assert(!std::is_reference_v<Lockable>,
                   "lock_guard<Lockable&> is not allowed; store a pointer or use std::ref");
+    static_assert(requires(Lockable& t) { t.unlock(); },
+                  "Lockable must have an unlock() method");
 
     Lockable* lock_;
 

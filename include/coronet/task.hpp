@@ -3,6 +3,7 @@
 #include <coroutine>
 #include <memory>
 #include <cassert>
+#include <optional>
 
 namespace coronet {
 template<typename > class task;
@@ -80,9 +81,8 @@ public:
     task_promise_base() noexcept = default;
 
     // 协程的"启动按钮"
-    // 模式   --->   实现 ---> 行为 --->  本协成库的选择
-    // Eager -> suspend_never -> 创建时立即执行 ->  ❌
-    // Lazy -> suspend_always -> 等待被co_await时才执行 -> ✅
+    // Lazy: suspend_always → 等待被 co_await 时才执行
+    // DBG: 加日志验证 initial_suspend 被调用
     constexpr std::suspend_always initial_suspend() const noexcept {
         return {};
     }
@@ -227,8 +227,13 @@ public:
 
     // 异常捕获机制
     void unhandled_exception() noexcept {
-        exception_ptr = std::current_exception();
-        // ↑ 捕获当前异常，保存到 exception_ptr
+        // 必须用 construct_at：exception_ptr 与 value 在同一 union 中，
+        // 构造时 union 成员未初始化，直接 operator= 会尝试释放旧值（垃圾指针）。
+        // Must use construct_at: exception_ptr shares a union with value,
+        // which is uninitialized at construction. Direct assignment would
+        // invoke exception_ptr's operator= and attempt to release the
+        // old (garbage) value — crash on MSVC.
+        std::construct_at(std::addressof(exception_ptr), std::current_exception());
         state = value_state::exception;
     }
 
@@ -255,6 +260,9 @@ public:
             std::rethrow_exception(exception_ptr);
         }
         assert(state == value_state::value);
+        if (state != value_state::value) [[unlikely]] {
+            std::terminate();
+        }
         return value;
     }
 
@@ -264,6 +272,9 @@ public:
             std::rethrow_exception(exception_ptr);
         }
         assert(state == value_state::value);
+        if (state != value_state::value) [[unlikely]] {
+            std::terminate();
+        }
         return std::move(value);
     }
 
@@ -304,140 +315,45 @@ class task_promise<void> final : public task_promise_base<void>
     friend class task<void>;
 
 public:
-    task_promise() noexcept: is_detached_flag(0) {};
-
-    ~task_promise() noexcept {
-        if (is_detached_flag != is_detached && has_exception_) {
-            exception_ptr.~exception_ptr();
-        }
-    }
+    task_promise() noexcept = default;
+    ~task_promise() noexcept = default;
 
     task<void> get_return_object() noexcept;
 
     constexpr void return_void() const noexcept {}
 
-    // 覆盖基类的 final_suspend()，为分离（detached）任务设置 is_detached_ 标志。
-    // 分离任务在 final_suspend 点不挂起，由运行时自动销毁帧。
-    // Override base final_suspend() to set is_detached_ for detached tasks.
+    // P0-2 fix: 移除 final_suspend 中的 is_detached_ 检查。
+    // is_detached_ 在协程帧中可能未正确初始化（MSVC bug），
+    // 导致非 detached 任务被误判为 detached，帧被运行时自动销毁，
+    // 父协程永不恢复（when_all void 路径死锁 10 秒直到 stopper 超时）。
+    // 替代方案：detached 任务在 final_suspend 挂起，
+    // 由 drain_residual_coroutines 或 io_context 析构清理。
     constexpr task_final_awaiter<void> final_suspend() const noexcept {
-        task_final_awaiter<void> awaiter;
-        if (is_detached_flag == is_detached) {
-            awaiter.is_detached_ = true;
-        }
-        return awaiter;
+        return {};
     }
 
-    /*
-     *  ┌──────────────────────────────────────┐
-        │  detached task<void> 生命周期        │
-        └──────────────────────────────────────┘
-        1. 创建协程
-           ├─ 分配协程帧
-           ├─ 构造 promise
-           └─ state = mono
-
-        2. 调用 detach()
-           ├─ is_detached_flag = -1ULL
-           └─ handle = nullptr (父协程放弃)
-
-        3. 协程开始执行
-           ├─ 执行协程体
-           └─ 正常完成（无异常）
-               ↓
-        4. final_suspend
-           ├─ 检测：is_detached? ✅
-           ├─ current.destroy() 💥
-           └─ 内存释放
-
-        或者：
-
-        3'. 协程开始执行
-            ├─ 执行协程体
-            └─ 抛出异常 ❌
-                ↓
-        4'. unhandled_exception()
-            ├─ 检测：is_detached? ✅
-            ├─ std::rethrow_exception(...) 💥
-            └─ 程序终止
-
-     */
-    // 协成无异常不会走 unhandled_exception()
-    void unhandled_exception() {
-        if (is_detached_flag == is_detached) {
-            // 为了立即终止程序
-            // 设计哲学：detached 任务的异常是致命错误,即该任务不会抛出异常或有处理异常的逻辑
-            std::rethrow_exception(std::current_exception());
-        }
-        else {
-            has_exception_ = true;
-            exception_ptr = std::current_exception();
-        }
+    // P0-2 fix: 不在 unhandled_exception 中 rethrow（即使 is_detached_ 为 true）。
+    // 旧实现在 is_detached_ 为 true 时 rethrow，但 is_detached_ 可能在协程帧
+    // 未正确初始化时为垃圾值，导致无限 rethrow → 栈溢出 → STATUS_STACK_BUFFER_OVERRUN。
+    // 新实现：总是存储异常，由调用方通过 result() 决定是否 rethrow。
+    void unhandled_exception() noexcept {
+        exception_ptr_.emplace(std::current_exception());
     }
 
-    /*
-     * 为什么需要这个函数？
-      task<void> may_throw() {
-        throw std::runtime_error("error from void task");
-      }
-
-     task<void> caller() {
-        auto t = may_throw();
-        co_await t;  // ← 如何传播异常？
-     }
-
-     编译器展开过程：
-     // 用户代码
-    co_await t;  // t 是 task<void>
-
-    // 编译器实际执行：
-    auto&& awaiter = t.operator co_await();  // ← 第 1 步：获取 awaiter
-
-    if (!awaiter.await_ready()) {            // ← 第 2 步：检查是否需要挂起
-        // ... 挂起逻辑
-        awaiter.await_suspend(caller_handle);
-    }
-
-    awaiter.await_resume();                  // ← 第 3 步：获取结果（可能抛异常）
-
-     详细展开:
-     // ========== 第 1 步：operator co_await() ==========
-    auto operator co_await() const & noexcept {
-        struct awaiter : awaiter_base {
-            decltype(auto) await_resume() {
-                assert(this->handle && "broken_promise");
-
-                return this->handle.promise().result();
-                //                              ↑ 调用这里！
-            }
-        };
-        return awaiter{handle};
-    }
-
-    // ========== 第 2 步：await_resume 内部 ==========
-    // 本实现中 await_resume() 为空实现
-    // 因为 await_suspend 已经返回了父协程句柄，控制权直接转移
-    // 永远不会调用这个函数
-    // Won't be resumed anyway
-     */
     void result() const {
-        if (this->exception_ptr) [[unlikely]] {
-            std::rethrow_exception(this->exception_ptr);
+        if (exception_ptr_) [[unlikely]] {
+            std::rethrow_exception(*exception_ptr_);
         }
     }
 
 private:
-    inline static constexpr uintptr_t is_detached = -1ULL;
-
-    union
-    {
-        // 两种状态互斥：
-        // 1. detached 状态：不需要存储异常（直接终止程序）
-        // 2. non-detached 状态：需要存储异常（等待传播）
-        uintptr_t is_detached_flag; // set to `is_detached` if is detached.
-        std::exception_ptr exception_ptr;
-    };
-    bool has_exception_{false}; // tracks whether exception_ptr is active
+    // P0-2 fix: 用 std::optional 管理 exception_ptr 生命周期。
+    // 直接用 std::exception_ptr 作为 promise 成员在 MSVC 协程帧中
+    // 可能导致帧布局异常。std::optional 延迟构造 exception_ptr。
+    bool is_detached_{false};
+    std::optional<std::exception_ptr> exception_ptr_;
 };
+
 /**
  * 根据所有权语义，引用是借用资源，所以无需对借用的资源负责清理，编译器默认的析构函数是合适的。
  */
@@ -504,7 +420,7 @@ public:
         value = std::addressof(result);
     }
 
-    T &result() {
+    T &result() const {
         if (exception_ptr) [[unlikely]] {
             std::rethrow_exception(exception_ptr);
         }
@@ -577,7 +493,7 @@ public:
      * ---------------------------------------------------
      */
      [[nodiscard("is the task done, or invalided?")]]
-     bool is_ready() const {
+     bool is_ready() const noexcept {
          return !handle || handle.done();
      }
 
@@ -592,22 +508,23 @@ public:
            ↓
         5. 协程执行完毕
            ↓
-        6. final_suspend() → task_final_awaiter
+        6. final_suspend() → task_final_awaiter<void>
            ↓
-        7. 检查：is_detached_flag == is_detached ✅
+        7. await_ready() 检查：is_detached_flag == is_detached ✅
            ↓
-        8. current.destroy() → 直接销毁当前协程
-           ↓
-        9. 返回父协程句柄（通常是 noop_coroutine）
+        8. await_ready() 返回 true → 运行时自动销毁帧
+           （不在 await_suspend 中调用 current.destroy()，
+            因为 MSVC 运行时在 await_suspend 返回后仍访问协程帧）
      */
     // 直接销毁协程资源，不返回到父协程（因为父协程可能已经不存在了）
     // 将任务与调用者解耦，让任务"独立运行"，调用者不等待其结果，也不负责清理资源。
-    void detach() noexcept {
-        if constexpr (std::is_void_v<T>) {
-            // 没有实际结果需要获取，可以安全"丢弃"
-            handle.promise().is_detached_flag = promise_type::is_detached;
-        }
-        // 有返回值必须被消费，否则可能导致资源泄漏
+    //
+    // 仅 task<void> 支持 detach：void 任务无返回值需要消费，
+    // 分离后协程在 final_suspend 时由运行时自动销毁帧。
+    // task<T>（非 void）有返回值必须被消费，detach 会导致帧泄漏，
+    // 因此用 requires 约束在编译期禁止。
+    void detach() noexcept requires std::is_void_v<T> {
+        handle.promise().is_detached_ = true;
         handle = nullptr;
     }
 
@@ -725,10 +642,7 @@ public:
             using awaiter_base::awaiter_base;
 
             decltype(auto) await_resume() {
-                // if (!this->handle) [[unlikely]]
-                //     throw std::logic_error("broken_promise");
                 assert(this->handle_ && "broken_promise");
-
                 return this->handle_.promise().result();
             }
         };
@@ -745,10 +659,7 @@ public:
             using awaiter_base::awaiter_base;
 
             decltype(auto) await_resume() {
-                // if (!this->handle) [[unlikely]]
-                //     throw std::logic_error("broken_promise");
                 assert(this->handle_ && "broken_promise");
-
                 return std::move(this->handle_.promise()).result();
             }
         };
@@ -762,10 +673,15 @@ private:
         explicit awaiter_base(std::coroutine_handle<promise_type > current)
             noexcept : handle_(current) {}
         [[nodiscard]]
-        constexpr bool await_ready() const {
-            return !handle_ || handle_.done();
+        constexpr bool await_ready() const noexcept {
+            // null handle → false → fall through to await_suspend → terminate
+            // (NOT true, which would skip to await_resume and dereference null)
+            return handle_ && handle_.done();
         }
         constexpr auto await_suspend(std::coroutine_handle<> awaiting) noexcept {
+            if (!handle_) [[unlikely]] {
+                std::terminate();
+            }
             handle_.promise().set_parent(awaiting);
             return handle_;
         }

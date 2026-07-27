@@ -8,12 +8,14 @@ set(coronet_gtest_tests
     generator_gtest
     channel_gtest
     shared_task_gtest
+    net_inet_address_gtest
+    net_socket_gtest
 )
 
 foreach(test_target ${coronet_gtest_tests})
     add_executable(${test_target} ${test_target}.cpp)
     target_link_libraries(${test_target} PRIVATE coronet::coronet gtest gtest_main)
-    add_test(NAME ${test_target} COMMAND $<TARGET_FILE:${test_target}>)
+    coronet_add_test(${test_target} COMMAND $<TARGET_FILE:${test_target}>)
 endforeach()
 
 # ---- Standalone integration tests (co_spawn + assert) ----
@@ -32,6 +34,9 @@ set(coronet_int_tests
     channel
     cv_notify_all
     cv_notify_one
+    net_echo
+    code_review_fixes
+    debug_void_exception
 )
 
 # stress_test uses POSIX sockets (sys/socket.h) — Linux only
@@ -42,5 +47,12 @@ endif()
 foreach(test_target ${coronet_int_tests})
     add_executable(${test_target} ${test_target}.cpp)
     target_link_libraries(${test_target} PRIVATE coronet::coronet)
-    add_test(NAME ${test_target} COMMAND $<TARGET_FILE:${test_target}>)
+    coronet_add_test(${test_target} COMMAND $<TARGET_FILE:${test_target}>)
 endforeach()
+
+# ---- TLS integration tests (requires OpenSSL) ----
+if(CORONET_WITH_TLS)
+    add_executable(tls_echo_test tls_echo_test.cpp)
+    target_link_libraries(tls_echo_test PRIVATE coronet::coronet)
+    coronet_add_test(tls_echo_test COMMAND $<TARGET_FILE:tls_echo_test>)
+endif()

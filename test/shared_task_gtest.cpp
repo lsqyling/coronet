@@ -29,7 +29,35 @@ using namespace coronet;
 
 namespace {
 
+// ============================================================
+// Coroutine helper functions (replacing coroutine lambdas)
+// C++20 标准推荐使用协程函数而非协程 lambda
+// ============================================================
+
+/// 创建返回指定 int 的 shared_task
+shared_task<int> make_st_int(int v) { co_return v; }
+
+/// 创建返回指定 string 的 shared_task
+shared_task<std::string> make_st_str(const char* s) { co_return std::string(s); }
+
+/// 创建抛出 runtime_error 的 shared_task<int>
+shared_task<int> make_st_throw_int(const char* msg) {
+    throw std::runtime_error(msg);
+    co_return 0;
+}
+
+/// 创建设置 flag 的 shared_task<void>
+shared_task<> make_st_set_flag(bool& flag) {
+    flag = true;
+    co_return;
+}
+
+/// 创建返回变量引用的 shared_task<int&>
+shared_task<int&> make_st_ref(int& v) { co_return v; }
+
+// ============================================================
 // Helper: run a coroutine inside an io_context
+// ============================================================
 //
 // 测试辅助函数：在 io_context 事件循环中执行协程。
 // 标准测试模式：
@@ -66,16 +94,16 @@ TEST(SharedTaskTest, DefaultConstruction) {
 // 验证 shared_task 的基本协程执行和值获取功能。
 // 创建一个返回 42 的协程，通过 co_await 等待其结果。
 // 这是 shared_task 最基础的使用模式：协程产生值 -> 等待者获取值。
-TEST(SharedTaskTest, BasicValue) {
-    run_io_test([]() -> task<> {
-        auto st = []() -> shared_task<int> {
-            co_return 42;
-        }();
+task<> test_basic_value() {
+    auto st = make_st_int(42);
 
-        int v = co_await st;
-        EXPECT_EQ(v, 42);
-        co_return;
-    });
+    int v = co_await st;
+    EXPECT_EQ(v, 42);
+    co_return;
+}
+
+TEST(SharedTaskTest, BasicValue) {
+    run_io_test(test_basic_value);
 }
 
 // ============================================================
@@ -89,25 +117,25 @@ TEST(SharedTaskTest, BasicValue) {
 //   3. 多次 co_await（包括在原始对象上再次等待）都返回相同的字符串 "hello"
 //   4. 结果具有复制语义，每次 co_await 都返回值的拷贝
 // 这个测试验证了引用计数共享所有权机制的正确性。
+task<> test_multiple_await() {
+    auto st = make_st_str("hello");
+
+    // Copy the shared_task
+    auto st2 = st;
+
+    std::string s1 = co_await st;
+    std::string s2 = co_await st2;
+    EXPECT_EQ(s1, "hello");
+    EXPECT_EQ(s2, "hello");
+
+    // Await again on the original
+    std::string s3 = co_await st;
+    EXPECT_EQ(s3, "hello");
+    co_return;
+}
+
 TEST(SharedTaskTest, MultipleAwait) {
-    run_io_test([]() -> task<> {
-        auto st = []() -> shared_task<std::string> {
-            co_return std::string("hello");
-        }();
-
-        // Copy the shared_task
-        auto st2 = st;
-
-        std::string s1 = co_await st;
-        std::string s2 = co_await st2;
-        EXPECT_EQ(s1, "hello");
-        EXPECT_EQ(s2, "hello");
-
-        // Await again on the original
-        std::string s3 = co_await st;
-        EXPECT_EQ(s3, "hello");
-        co_return;
-    });
+    run_io_test(test_multiple_await);
 }
 
 // ============================================================
@@ -122,32 +150,31 @@ TEST(SharedTaskTest, MultipleAwait) {
 //   4. 异常类型（std::runtime_error）和异常消息在传播中保持一致
 // 这个测试验证了 shared_task 对异常的正确处理：
 // 无论有多少个等待者，所有等待者都能看到同一个异常。
+task<> test_exception_propagation() {
+    auto st = make_st_throw_int("test error");
+
+    bool caught = false;
+    try {
+        co_await st;
+    } catch (const std::runtime_error& e) {
+        EXPECT_STREQ(e.what(), "test error");
+        caught = true;
+    }
+    EXPECT_TRUE(caught);
+
+    // Second await should also throw
+    caught = false;
+    try {
+        co_await st;
+    } catch (const std::runtime_error&) {
+        caught = true;
+    }
+    EXPECT_TRUE(caught);
+    co_return;
+}
+
 TEST(SharedTaskTest, ExceptionPropagation) {
-    run_io_test([]() -> task<> {
-        auto st = []() -> shared_task<int> {
-            throw std::runtime_error("test error");
-            co_return 0;
-        }();
-
-        bool caught = false;
-        try {
-            co_await st;
-        } catch (const std::runtime_error& e) {
-            EXPECT_STREQ(e.what(), "test error");
-            caught = true;
-        }
-        EXPECT_TRUE(caught);
-
-        // Second await should also throw
-        caught = false;
-        try {
-            co_await st;
-        } catch (const std::runtime_error&) {
-            caught = true;
-        }
-        EXPECT_TRUE(caught);
-        co_return;
-    });
+    run_io_test(test_exception_propagation);
 }
 
 // ============================================================
@@ -161,18 +188,18 @@ TEST(SharedTaskTest, ExceptionPropagation) {
 // 测试验证：
 //   1. when_ready() 等待后协程确实已经完成（is_ready）
 //   2. 在 when_ready() 之后仍然可以通过 co_await 正常获取值
-TEST(SharedTaskTest, WhenReady) {
-    run_io_test([]() -> task<> {
-        auto st = []() -> shared_task<int> {
-            co_return 100;
-        }();
+task<> test_when_ready() {
+    auto st = make_st_int(100);
 
-        co_await st.when_ready();
-        // After when_ready, the value should be available
-        int v = co_await st;
-        EXPECT_EQ(v, 100);
-        co_return;
-    });
+    co_await st.when_ready();
+    // After when_ready, the value should be available
+    int v = co_await st;
+    EXPECT_EQ(v, 100);
+    co_return;
+}
+
+TEST(SharedTaskTest, WhenReady) {
+    run_io_test(test_when_ready);
 }
 
 // ============================================================
@@ -187,9 +214,7 @@ TEST(SharedTaskTest, WhenReady) {
 //   4. moved-from 状态的对象 get_handle() 返回空
 // 这是对 shared_task 所有权转移的完整性验证。
 TEST(SharedTaskTest, MoveSemantics) {
-    shared_task<int> t1 = []() -> shared_task<int> {
-        co_return 42;
-    }();
+    shared_task<int> t1 = make_st_int(42);
 
     auto handle = t1.get_handle();
     EXPECT_TRUE(handle);
@@ -216,24 +241,23 @@ TEST(SharedTaskTest, MoveSemantics) {
 //   3. 多次 co_await 同一个 shared_task<void> 是合法的
 // 此测试使用 static 变量跟踪协程是否被执行，验证 lazy 语义
 // 和多次等待的正确性。
+task<> test_void_return() {
+    static bool executed = false;
+    executed = false;
+
+    auto st = make_st_set_flag(executed);
+
+    co_await st;
+    EXPECT_TRUE(executed);
+
+    // Second await
+    co_await st;
+    EXPECT_TRUE(executed);
+    co_return;
+}
+
 TEST(SharedTaskTest, VoidReturn) {
-    run_io_test([]() -> task<> {
-        static bool executed = false;
-        executed = false;
-
-        auto st = [&]() -> shared_task<> {
-            executed = true;
-            co_return;
-        }();
-
-        co_await st;
-        EXPECT_TRUE(executed);
-
-        // Second await
-        co_await st;
-        EXPECT_TRUE(executed);
-        co_return;
-    });
+    run_io_test(test_void_return);
 }
 
 // ============================================================
@@ -248,27 +272,27 @@ TEST(SharedTaskTest, VoidReturn) {
 //   4. 再次 co_await 返回更新后的值
 // 引用语义在共享协程中尤为重要，多个等待者可能通过引用来共享
 // 和修改同一个状态。
+task<> test_reference_return() {
+    static int value = 123;
+
+    auto st = make_st_ref(value);
+
+    int& ref = co_await st;
+    EXPECT_EQ(ref, 123);
+    EXPECT_EQ(&ref, &value);
+
+    // Modify through reference
+    ref = 456;
+    EXPECT_EQ(value, 456);
+
+    // Second await returns updated value
+    int& ref2 = co_await st;
+    EXPECT_EQ(ref2, 456);
+    co_return;
+}
+
 TEST(SharedTaskTest, ReferenceReturn) {
-    run_io_test([]() -> task<> {
-        static int value = 123;
-
-        auto st = []() -> shared_task<int&> {
-            co_return value;
-        }();
-
-        int& ref = co_await st;
-        EXPECT_EQ(ref, 123);
-        EXPECT_EQ(&ref, &value);
-
-        // Modify through reference
-        ref = 456;
-        EXPECT_EQ(value, 456);
-
-        // Second await returns updated value
-        int& ref2 = co_await st;
-        EXPECT_EQ(ref2, 456);
-        co_return;
-    });
+    run_io_test(test_reference_return);
 }
 
 } // namespace

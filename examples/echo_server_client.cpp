@@ -20,7 +20,7 @@ constexpr int BufSize = 4096;
 
 // ---- Echo server session ----
 coronet::task<> echo_session(int sockfd) {
-    coronet::socket sock{sockfd};
+    coronet::tcp_socket sock{sockfd};
     char buf[BufSize];
 
     while (true) {
@@ -39,7 +39,7 @@ coronet::task<> echo_session(int sockfd) {
 
 // ---- Echo server (accepts one connection then exits) ----
 coronet::task<> echo_server() {
-    coronet::acceptor ac{coronet::inet_address{TestPort}};
+    coronet::tcp_acceptor ac{coronet::inet_address{TestPort}};
     std::printf("[server] listening on port %d\n", TestPort);
 
     // Accept just one connection for the test
@@ -62,7 +62,7 @@ coronet::task<> echo_client(bool& success, coronet::io_context& ctx) {
         co_return;
     }
 
-    coronet::socket sock{coronet::socket::create_tcp(addr.family())};
+    coronet::tcp_socket sock{coronet::tcp_socket::create_tcp(addr.family())};
     std::printf("[client] connecting to 127.0.0.1:%d\n", TestPort);
 
     int conn_res = co_await sock.connect(addr);

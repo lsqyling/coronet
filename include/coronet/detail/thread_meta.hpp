@@ -1,7 +1,7 @@
 #pragma once
 
 #include "coronet/config/io_context.hpp"
-#include <atomic>
+#include <coroutine>
 
 namespace coronet { class io_context; }
 namespace coronet::detail { struct worker_meta; }
@@ -22,5 +22,12 @@ struct alignas(config::cache_line_size) thread_meta {
 
 /// Thread-local current context
 extern thread_local thread_meta this_thread;
+
+/// 将协程句柄调度到当前线程的 worker 上恢复。
+/// 供不希望依赖 worker_meta 完整定义的调用点（如 trivial_task）使用，
+/// 实现位于 worker_meta.cpp。
+/// Schedule a coroutine handle onto the current thread's worker for resumption.
+/// Used by call sites that wish to avoid depending on worker_meta's full definition.
+void schedule_on_this_thread(std::coroutine_handle<> handle) noexcept;
 
 } // namespace coronet::detail

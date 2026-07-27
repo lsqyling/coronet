@@ -5,15 +5,20 @@
 # Require C++20 as a target-level feature (works regardless of include order)
 target_compile_features(coronet PUBLIC cxx_std_20)
 
-# MSVC needs EHsc for C++ exception handling
-if(MSVC)
-    add_compile_options(/EHsc)
-endif()
+# MSVC needs /EHsc for C++ exception handling; GCC/Clang get -Wall -Wextra.
+# Applied at target level (PUBLIC) so consumers inherit EHsc too,
+# but extern deps (googletest, benchmark) are not affected.
+target_compile_options(coronet PUBLIC
+    $<$<CXX_COMPILER_ID:MSVC>:/EHsc>
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
+)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")
     message(NOTICE "Setting default CMAKE_BUILD_TYPE to Release")
 endif()
+message(NOTICE "Build type: ${CMAKE_BUILD_TYPE}")
+
 
 # Release build optimizations
 if(CMAKE_BUILD_TYPE STREQUAL "Release")

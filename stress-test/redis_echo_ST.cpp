@@ -13,7 +13,7 @@ constexpr int DefaultPort = 6379;
 constexpr int BufSize = 4096;
 
 coronet::task<> redis_session(int sockfd) {
-    coronet::socket sock{sockfd};
+    coronet::tcp_socket sock{sockfd};
     char buf[BufSize];
     constexpr const char* pong = "+PONG\r\n";
     constexpr int pong_len = 7;
@@ -28,7 +28,7 @@ coronet::task<> redis_session(int sockfd) {
 }
 
 coronet::task<> redis_server(uint16_t port) {
-    coronet::acceptor ac{coronet::inet_address{port}};
+    coronet::tcp_acceptor ac{coronet::inet_address{port}};
     std::fprintf(stderr, "[coronet ST] listening on port %d\n", port);
     std::fflush(stderr);
 

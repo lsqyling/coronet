@@ -11,7 +11,7 @@
 #endif
 
 using namespace coronet;
-using Socket = coronet::socket;
+using Socket = coronet::tcp_socket;
 
 // Receive from socket, write to stdout
 task<> recv_session(Socket sock) {
@@ -38,7 +38,7 @@ task<> send_session(Socket sock) {
 }
 
 task<> server(uint16_t port) {
-    acceptor ac{inet_address{port}};
+    tcp_acceptor ac{inet_address{port}};
     for (int sockfd; (sockfd = co_await ac.accept()) >= 0;) {
         co_spawn(recv_session(Socket{sockfd}));
         co_spawn(send_session(Socket{sockfd}));

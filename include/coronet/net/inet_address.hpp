@@ -87,10 +87,13 @@ public:
 
     bool operator==(const inet_address& rhs) const noexcept;
 
-    /// DNS resolution
+    /// DNS resolution (blocking — do not call in event loop)
     /// Single address resolution (returns first result).
+    /// @note 阻塞调用（getaddrinfo），可能耗时数秒。
+    ///       不要在协程事件循环中直接调用，应通过线程池 offload。
     static bool resolve(std::string_view hostname, uint16_t port, inet_address& out);
     /// Multiple address resolution (returns all results, e.g. round-robin DNS).
+    /// @note 同 resolve()，阻塞调用。异步版本计划在 Phase 2 实现。
     static std::vector<inet_address> resolve_all(
         std::string_view hostname, uint16_t port, const struct addrinfo* hints);
 

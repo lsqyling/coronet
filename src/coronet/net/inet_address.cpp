@@ -1,6 +1,7 @@
 #include "coronet/net/inet_address.hpp"
 
 #include <cstring>
+#include <string>
 
 namespace coronet {
 
@@ -14,17 +15,21 @@ namespace coronet {
 inet_address::inet_address(std::string_view ip, uint16_t port) noexcept {
     std::memset(&storage_, 0, sizeof(storage_));
 
+    // P0-2 fix: string_view::data() is NOT guaranteed null-terminated.
+    // inet_pton requires a C string. Copy to std::string for safety.
+    std::string ip_str{ip};
+
     // Try IPv4 first
     ss().sin_family = AF_INET;
     ss().sin_port = htons(port);
-    if (::inet_pton(AF_INET, ip.data(), &ss().sin_addr) == 1) {
+    if (::inet_pton(AF_INET, ip_str.c_str(), &ss().sin_addr) == 1) {
         return; // IPv4 success
     }
 
     // Try IPv6
     ss6().sin6_family = AF_INET6;
     ss6().sin6_port = htons(port);
-    if (::inet_pton(AF_INET6, ip.data(), &ss6().sin6_addr) == 1) {
+    if (::inet_pton(AF_INET6, ip_str.c_str(), &ss6().sin6_addr) == 1) {
         return; // IPv6 success
     }
 
@@ -78,7 +83,11 @@ std::string inet_address::to_ip() const {
 }
 
 /// 格式化为 "IP:端口" 字符串，便于日志和调试。
+/// P1-10 fix: IPv6 地址含多个 ':'，必须用方括号包裹以区分地址和端口。
+/// 符合 RFC 3986 规范：[::1]:8080
 std::string inet_address::to_ip_port() const {
+    if (family() == AF_INET6)
+        return "[" + to_ip() + "]:" + std::to_string(port());
     return to_ip() + ":" + std::to_string(port());
 }
 
@@ -117,6 +126,10 @@ bool inet_address::resolve(std::string_view hostname, uint16_t port,
 /// 返回所有解析到的地址。适用于需要尝试多个地址的场景
 /// （例如轮询 DNS 或同时支持 IPv4/IPv6）。
 ///
+/// @note 此函数是同步阻塞调用（getaddrinfo），可能耗时数秒。
+///       不要在协程事件循环中直接调用，应通过线程池 offload。
+///       异步版本 resolve_async() 计划在 Phase 2 实现。
+///
 /// @param hostname 主机名
 /// @param port 端口号
 /// @param hints 可选参数，用于指定地址族等过滤条件（如 ai_family = AF_INET6）
@@ -127,8 +140,12 @@ std::vector<inet_address> inet_address::resolve_all(
     std::vector<inet_address> result;
     std::string port_str = std::to_string(port);
 
+    // P0-3 fix: string_view::data() is NOT guaranteed null-terminated.
+    // getaddrinfo requires C strings. Copy to std::string for safety.
+    std::string host_str{hostname};
+
     struct addrinfo* ai_list = nullptr;
-    int rc = ::getaddrinfo(hostname.data(), port_str.c_str(), hints, &ai_list);
+    int rc = ::getaddrinfo(host_str.c_str(), port_str.c_str(), hints, &ai_list);
     if (rc != 0) return result;
 
     for (struct addrinfo* ai = ai_list; ai != nullptr; ai = ai->ai_next) {

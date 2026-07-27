@@ -15,6 +15,8 @@
 #include <coroutine>
 #include <utility>
 
+#include "coronet/detail/thread_meta.hpp"
+
 namespace coronet::detail {
 
 // ============================================================
@@ -68,20 +70,33 @@ struct chained_awaiter {
 
     void await_suspend(std::coroutine_handle<> h) noexcept {
         // 移动后 io_info_ 地址变化，刷新 user_data
-        // After move, io_info_ address changed — refresh user_data
         first.refresh_user_data();
         second.refresh_user_data();
 
         // 用户协程在第二个操作完成后恢复
-        // Coroutine resumes when SECOND operation completes
         second.io_info_.handle = h;
 
         // 第一个操作完成时，handle_completion 通过 chain_target 找到
-        // 第二个 awaiter，调用其内置的 chain_dispatch_fn（per-type
-        // CRTP 静态分发，编译期已知完整类型）。
+        // 第二个 awaiter，调用其 chain_dispatch_fn 启动第二个 I/O。
         first.io_info_.chain_target = &second;
         first.io_info_.handle = nullptr;
-        first.do_issue_io();  // 启动第一个操作（epoll: 注册 fd；IOCP: 发起 I/O）
+
+        // P1-1 fix: chained_awaiter 调用 do_issue_io() 而非 await_suspend()，
+        // 所以 win_awaiter_base::await_suspend 中的 ++requests_to_reap 和
+        // work_started() 不会被调用。在此手动递增。
+        // 第一次 I/O 完成时 handle_completion 会递减，链式启动第二次时
+        // handle_completion 中的 ++requests_to_reap 负责第二次的平衡。
+        if (detail::this_thread.worker) {
+            ++detail::this_thread.worker->requests_to_reap;
+        }
+#if defined(CORONET_PLATFORM_WINDOWS)
+        if (detail::this_thread.worker && detail::this_thread.worker->proactor) {
+            static_cast<platform::iocp::iocp_proactor*>(
+                detail::this_thread.worker->proactor)->work_started();
+        }
+#endif
+
+        first.do_issue_io();  // 启动第一个操作
     }
 
     int32_t await_resume() const noexcept {

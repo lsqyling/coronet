@@ -7,7 +7,8 @@
   <img src="https://img.shields.io/badge/Linux-GCC%2013%20%7C%20Clang%2018-brightgreen" alt="Linux">
   <img src="https://img.shields.io/badge/Windows-MSVC%2019.41-blue" alt="Windows">
   <img src="https://img.shields.io/badge/I/O-epoll%20%7C%20io__uring%20%7C%20IOCP-orange" alt="IO">
-  <img src="https://img.shields.io/badge/test-22%2F22%20passed-success" alt="Tests">
+  <img src="https://img.shields.io/badge/TLS-OpenSSL%203.4-green" alt="TLS">
+  <img src="https://img.shields.io/badge/test-31%2F31%20passed-success" alt="Tests">
 </p>
 
 ---
@@ -16,6 +17,7 @@
 
 | 🎯 | 特性 | 说明 |
 |:--:|------|------|
+| 🔒 | **TLS 加密传输** | `tls_socket` / `tls_context` / `tls_acceptor`，OpenSSL 3.x，双向验证 + ALPN |
 | 🔌 | **三后端热插拔** | epoll（默认）⇄ io_uring（`-DCORONET_IOURING=ON`）⇄ IOCP（Windows 自动） |
 | 🖥️ | **全编译器跨平台** | Linux GCC 13 / Clang 18 + Windows MSVC 19.41，一套代码 |
 | ⚡ | **编译期零开销多态** | CRTP + `#ifdef` 平台选择，无虚表、无堆分配 Proactor |
@@ -41,7 +43,71 @@
 | GCC 13.3 (Linux) | 48,662 | io_uring |
 | Clang 18.1 (Linux) | 47,304 | io_uring |
 
-> 完整报告 → [doc/aio_PR.md](doc/aio_PR.md) | 测试报告 → [doc/test_Report.md](doc/test_Report.md)
+**C1000K 压测 — 1,000,000 请求 × 1,000 并发, Windows 11 + MSVC 19.41 (IOCP)**
+
+| 服务端（单线程） | RPS | CPU% | 内存 | 状态 |
+|--------|-----:|:---:|-----:|:---:|
+| coronet ST (协程) | **50,955** | 28.4% | 5 MB | ✅ |
+| coronet chain (链式) | 50,375 | 30.7% | 5 MB | ✅ |
+| ASIO ST (回调) | 46,705 | 40.8% | 5 MB | ✅ |
+| **coronet vs ASIO** | **+9%** | **低 30%** | 持平 | — |
+
+| 服务端（6 线程） | RPS | CPU% | 内存 | 状态 |
+|--------|-----:|:---:|-----:|:---:|
+| coronet MT (6) | **50,140** | 31.0% | 6 MB | ✅ |
+| ASIO MT (6) | 30,071 | 80.4% | 6 MB | ✅ |
+| **coronet vs ASIO** | **+67%** | **低 61%** | 持平 | — |
+
+> 📖 详细文档 → [CodeReview 报告](doc/CodeReview.md) | [测试报告](doc/TestReport.md) | [API 手册](doc/ApiManual.md)
+
+---
+
+## 🔒 TLS 加密传输
+
+30 秒搭建 TLS 回声服务：
+
+```cpp
+#include <coronet/coronet.hpp>
+#include <coronet/net/tls.hpp>
+using namespace coronet;
+
+task<> tls_session(tls_socket sock) {
+    char buf[1024];
+    while (int n = co_await sock.recv(buf)) {
+        co_await sock.send({buf, (size_t)n});
+    }
+}
+
+task<> tls_server(uint16_t port) {
+    tls_context ctx{tls_context::mode::server};
+    ctx.load_cert_file("server.crt", "server.key");   // PEM 证书
+    ctx.set_alpn({"http/1.1"});
+
+    tls_acceptor ac{inet_address{port}, ctx};
+    while (true) co_spawn(tls_session(co_await ac.accept_socket()));
+}
+
+// 客户端
+task<> tls_client(const char* host) {
+    tls_context ctx{tls_context::mode::client};
+    ctx.set_verify_peer(true);
+    ctx.set_default_verify_paths();                    // 系统 CA 证书
+
+    auto sock = co_await tls_socket::connect(host, ctx);
+    co_await sock.send(std::span{"PING", 4});
+    co_return;
+}
+```
+
+特性：
+- **BIO 桥接架构** — 内存 BIO 将同步 SSL 操作接入异步 I/O 事件循环
+- **ALPN 协商** — `h2` / `http/1.1` 协议选择
+- **双向验证** — 服务端出示证书，客户端可选验证
+- **安全加固** — `SSL_OP_NO_COMPRESSION` / `SSL_OP_NO_RENEGOTIATION`
+- **优雅关闭** — `close_graceful()` 完整双向 `SSL_shutdown`，避免 RST
+
+> 构建：`cmake -DCORONET_WITH_TLS=ON ..`（默认启用），需 OpenSSL 3.x
+> TLS API 完整文档 → [API 手册 §四](doc/ApiManual.md)
 
 ---
 
@@ -593,6 +659,8 @@ cmake -S . -B build -G Ninja -DCORONET_DEVELOPER_MODE=OFF -DCORONET_BUILD_TESTS=
 
 ## 🧪 CTest 测试矩阵
 
+> 完整测试方法与用例清单 → [doc/TestManual.md](doc/TestManual.md)
+
 ```bash
 # 运行全部
 ctest --output-on-failure -j4
@@ -605,10 +673,10 @@ ctest -R stress_driver  # 压测 (ST / MT)
 
 | 平台 / 编译器 | 后端 | 测试数 | 结果 |
 |:---|:---|:---:|:---:|
-| Linux GCC 13.3 | epoll | 22/22 | ✅ |
-| Linux Clang 18.1 | epoll | 22/22 | ✅ |
-| Linux GCC 13.3 | io_uring | 22/22 | ✅ |
-| Windows MSVC 19.41 | IOCP | 21/21 | ✅ |
+| Linux GCC 13.3 | epoll | 27/27 | ✅ |
+| Linux Clang 18.1 | epoll | 27/27 | ✅ |
+| Linux GCC 13.3 | io_uring | 27/27 | ✅ |
+| Windows MSVC 19.41 | IOCP | 27/27 | ✅ |
 
 ---
 
@@ -631,6 +699,20 @@ ctest -R stress_driver_ST
 
 添加新服务端**无需改 stress_driver 代码** — 在 CMakeLists 中追加 `--server name:binary:port` 即可。
 
+### C1000K 百万级压测
+
+C1000K 基准脚本（1M 请求 × 1K 并发）已移至 `script/`，原始报告存于 `data/bench_c1000k/`：
+
+```bash
+# Linux (epoll / io_uring)
+bash script/linux/bench_c1000k.sh
+
+# Windows (IOCP)
+pwsh script/win/bench_c1000k.ps1
+```
+
+> 完整 C1000K 结果与结论 → [doc/BENCHMARK_REPORT.md](doc/BENCHMARK_REPORT.md)
+
 ---
 
 ## 📂 目录
@@ -646,11 +728,16 @@ coronet/
 │   ├── platform/          #   epoll / io_uring / IOCP
 │   └── detail/            #   内部实现
 ├── src/coronet/           # .cpp 实现
-├── test/                  # 21 项 CTest
+├── test/                  # 19 项 CTest (4 gtest + 15 集成)
 ├── bench/                 # Google Benchmark
-├── stress-test/           # 压测驱动 + 服务端
+├── stress-test/           # 压测驱动 + 服务端源码
 ├── examples/              # 示例程序
-├── doc/                   # 性能报告 / API 手册
+├── script/                # 构建与压测脚本
+│   ├── linux/             #   .sh / .py (epoll / io_uring)
+│   └── win/               #   .ps1 / .bat (IOCP)
+├── data/                  # 测试数据 / 压测结果
+│   └── bench_c1000k/      #   C1000K 压测报告 (csv + txt)
+├── doc/                   # 性能报告 / 测试报告 / API 手册
 └── cmake/                 # CMake 模块
 ```
 

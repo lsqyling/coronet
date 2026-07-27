@@ -1,0 +1,2 @@
+Source,Destination,Size_GB,Chunk_MB,Copy_ms,Copy_MBps,Verify_ms,Verify_OK,Chunks_Copied,Chunks_Verified,CPU_pct,Avg_Mem_MB,Peak_Mem_MB
+D:/dev/workspace/yidaoyun/coronet-win/data/windows_10_professional_x64_2026.iso,D:\Users\10580\Desktop/windows_10_professional_x64_2026.iso,4.90691,1,25721,195.353,0,YES,5025,0,5.82961,8,9

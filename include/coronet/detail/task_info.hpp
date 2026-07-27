@@ -15,9 +15,11 @@ namespace coronet::detail {
  * 字段设计：
  * - handle：等待此 I/O 完成的协程句柄。当 I/O 完成时，通过此句柄恢复协程。
  * - result：I/O 操作的结果（字节数或错误码），与 POSIX read/write 等返回值一致。
- * - chain_ctx / chain_fn：用于链式 I/O（co_await (op1 && op2)）：
+ * - chain_target：链式 I/O 中指向下一个 awaiter 的指针（co_await (op1 && op2)）：
  *   - 在 io_uring 后端，链式操作由内核的 IOSQE_IO_LINK 完成，无需用户态回调
- *   - 在 epoll/IOCP 后端，第一个操作完成时通过 chain_fn 启动第二个操作
+ *   - 在 epoll/IOCP 后端，第一个操作完成时通过 chain_target（指向
+ *     win_chain_base / epoll_chain_base）调用其内置的 chain_dispatch_fn，
+ *     该函数指针在 CRTP 实例化时已知完整类型，编译器可生成静态调用
  *
  * user_data 编码方案（64 位）：
  * - bits [63:3]：指向 task_info 的指针（8 字节对齐，低 3 位为 0）
@@ -60,8 +62,9 @@ struct task_info {
         return reinterpret_cast<task_info*>(ud & ~uint64_t(7));
     }
 
-    /// Extract type tag from user_data
-    /// 从 user_data 提取类型标记
+    /// Extract type tag from user_data (reserved for future use)
+    /// 从 user_data 提取类型标记（预留扩展）
+    [[maybe_unused]]
     static uint8_t type_tag(uint64_t ud) noexcept {
         return static_cast<uint8_t>(ud & 7);
     }

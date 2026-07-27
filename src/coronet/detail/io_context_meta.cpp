@@ -20,21 +20,17 @@ namespace coronet::detail {
 io_context_meta g_io_context_meta;
 
 void io_context_meta::wait_all_ready() noexcept {
-    // 自旋等待，直到所有已创建的 io_context 都调用了 start()
-    // Spin-wait until all created io_contexts have called start()
+    // C++20 std::atomic::wait/notify_all: uses OS futex (Linux) /
+    // WaitOnAddress (Windows) — more efficient than spin-yield.
+    // The wait blocks the thread until ready_count changes, avoiding
+    // wasted CPU cycles. notify_all() is called in io_context::start().
     //
-    // 自旋 vs 条件变量：
-    // 在大多数使用场景中，io_context 数量很少（1-4 个），
-    // 且 start() 在短时间内被连续调用，自旋等待的开销很小。
-    // 条件变量虽然更优雅，但会引入额外的系统调用和唤醒延迟。
-    //
-    // In a proper implementation this would use a condition_variable,
-    // but a simple spin is acceptable for the common case (1-4 contexts).
-    while (ready_count.load(std::memory_order_acquire) <
-           create_count.load(std::memory_order_acquire)) {
-        // 让出 CPU 时间片，避免忙等耗尽 CPU
-        // yield the CPU to avoid busy-wait starvation
-        std::this_thread::yield();
+    // C++20 原子等待/通知：使用 OS futex（Linux）/ WaitOnAddress（Windows），
+    // 比自旋 yield 更高效。线程阻塞直到 ready_count 变化，避免浪费 CPU。
+    uint32_t cur = ready_count.load(std::memory_order_acquire);
+    while (cur < create_count.load(std::memory_order_acquire)) {
+        ready_count.wait(cur, std::memory_order_acquire);
+        cur = ready_count.load(std::memory_order_acquire);
     }
 }
 

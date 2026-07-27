@@ -63,6 +63,24 @@ inline auto shutdown(int fd, int how) noexcept
     { return detail::platform_io::make_shutdown(fd, how); }
 
 // ============================================================
+// UDP operations: recvfrom / sendto
+// ============================================================
+// UDP 数据报收发 — 用于无连接的 UDP 通信。
+// recvfrom 返回 recvfrom_result{bytes, sockaddr_storage}，
+// 包含接收到的字节数和源地址。
+// sendto 发送数据报到指定目标地址，返回发送的字节数。
+
+[[nodiscard("Did you forget to co_await?")]]
+inline auto recvfrom(int fd, std::span<char> buf, int flags = 0) noexcept
+    { return detail::platform_io::make_recvfrom(fd, buf, flags); }
+
+[[nodiscard("Did you forget to co_await?")]]
+inline auto sendto(int fd, std::span<const char> buf,
+                   const struct sockaddr* addr, socklen_t addrlen,
+                   int flags = 0) noexcept
+    { return detail::platform_io::make_sendto(fd, buf, addr, addrlen, flags); }
+
+// ============================================================
 // 文件 I/O / File I/O
 // ============================================================
 // epoll 不支持普通文件 → 后台线程 + pipe 信号

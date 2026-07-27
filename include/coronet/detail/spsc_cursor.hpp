@@ -1,8 +1,8 @@
 #pragma once
 
+#include "coronet/config/io_context.hpp"
 #include <atomic>
 #include <cstdint>
-#include <cassert>
 
 namespace coronet::detail {
 
@@ -103,35 +103,46 @@ struct spsc_cursor {
     // --- atomic / non-atomic accessors ---
 
     constexpr cur_t head() const noexcept {
-        if constexpr (is_safe) return head_.load(std::memory_order_acquire);
+        if constexpr (is_safe) return head_.v.load(std::memory_order_acquire);
         else                   return head_;
     }
 
     constexpr void set_head(cur_t h) noexcept {
-        if constexpr (is_safe) head_.store(h, std::memory_order_release);
+        if constexpr (is_safe) head_.v.store(h, std::memory_order_release);
         else                   head_ = h;
     }
 
     constexpr cur_t tail() const noexcept {
-        if constexpr (is_safe) return tail_.load(std::memory_order_acquire);
+        if constexpr (is_safe) return tail_.v.load(std::memory_order_acquire);
         else                   return tail_;
     }
 
     constexpr void set_tail(cur_t t) noexcept {
-        if constexpr (is_safe) tail_.store(t, std::memory_order_release);
+        if constexpr (is_safe) tail_.v.store(t, std::memory_order_release);
         else                   tail_ = t;
     }
 
 private:
-    // On x86 plain loads/stores are already acquire/release (for aligned integers),
-    // but for cross-platform correctness we use atomic unconditionally when is_safe.
-    // x86 上普通的对齐整数加载/存储已经是 acquire/release 语义，
-    // 但为了跨平台正确性，is_safe 时无条件使用原子操作。
-    [[no_unique_address]]
-    std::conditional_t<is_safe, std::atomic<cur_t>, cur_t> head_{0};
+    // Cache-line isolation: when is_safe=true (cross-thread), the producer
+    // writes tail_ while the consumer writes head_. If they share a cache
+    // line, every write invalidates the other core's cache — classic false
+    // sharing. padded_atomic forces each cursor onto its own cache line.
+    //
+    // When is_safe=false (single-threaded), plain cur_t is used — zero
+    // padding overhead via std::conditional_t.
+    //
+    // 缓存行隔离：is_safe=true（跨线程）时，生产者写 tail_、消费者写 head_，
+    // 若共用缓存行会产生严重的 false sharing。padded_atomic 强制每个游标
+    // 独占一个缓存行。is_safe=false（单线程）时使用普通整数，零开销。
+    struct alignas(config::cache_line_size) padded_atomic {
+        std::atomic<cur_t> v{0};
+    };
 
     [[no_unique_address]]
-    std::conditional_t<is_safe, std::atomic<cur_t>, cur_t> tail_{0};
+    std::conditional_t<is_safe, padded_atomic, cur_t> head_{};
+
+    [[no_unique_address]]
+    std::conditional_t<is_safe, padded_atomic, cur_t> tail_{};
 };
 
 } // namespace coronet::detail

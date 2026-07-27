@@ -25,9 +25,9 @@ cmake -S . -B build-release -DCORONET_BUILD_EXAMPLES=ON -DCORONET_BUILD_BENCHMAR
 
 ```bash
 # Build & run all tests
-cmake --build build-release --target task_gtest generator_gtest proactor_gtest \
+cmake --build build-release --target task_gtest generator_gtest \
     channel_gtest shared_task_gtest ft_task coro_lifetime generator_test \
-    move_shared_task stress_test
+    move_shared_task
 
 # Build & run all examples
 cmake --build build-release --target example_iota example_timer example_mutex \
@@ -36,8 +36,8 @@ cmake --build build-release --target example_iota example_timer example_mutex \
     example_when_all example_when_any example_when_some example_timer_accuracy
 
 # Smoke tests
-bash doc/linux/smoke_all.sh          # Linux
-powershell doc/win/smoke.ps1          # Windows
+bash script/linux/smoke_all.sh          # Linux
+powershell script/win/smoke.ps1          # Windows
 ```
 
 ## Architecture
@@ -62,8 +62,10 @@ include/coronet/
   platform/
     platform.hpp        — platform detection + completion_info
     proactor.hpp        — C++20 concepts (operation_concept, proactor_concept)
+    proactor_selector.hpp — platform proactor selection bridge (single entry point)
     io_uring/           — Linux io_uring backend
     iocp/               — Windows IOCP backend
+    epoll/              — Linux epoll backend (fallback when io_uring unavailable)
   detail/
     worker_meta.hpp     — per-worker state (SPSC ring, cross-thread queue)
     spsc_cursor.hpp     — lock-free SPSC cursor
@@ -72,10 +74,10 @@ include/coronet/
   utility/
     defer.hpp           — RAII defer (co_context-aligned)
   log/log.hpp           — compile-time-level logging
-lib/coronet/
+src/coronet/
   io_context.cpp        — event loop (run/start/join/co_spawn)
   detail/worker_meta.cpp
-  platform/{io_uring,iocp}/*.cpp
+  platform/{io_uring,iocp,epoll}/*.cpp
 ```
 
 ## Key Design Decisions
@@ -99,4 +101,16 @@ lib/coronet/
 |----------|---------|
 | `script/linux/` | Linux benchmark + smoke test + build scripts |
 | `script/win/` | Windows benchmark + smoke test + build scripts |
+| `script/cleanup.py` | Post-test cleanup (kills leftover processes, removes temp files) |
 | `doc/aio_PR.md` | Complete performance report |
+
+## CTest Cleanup
+
+Tests are registered via `coronet_add_test()` which binds the `coronet_env` fixture.
+After all tests complete, CTest automatically runs `coronet_cleanup` (calling
+`script/cleanup.py`) to kill leftover stress-test processes and remove temp files.
+
+```bash
+# Manual cleanup (without running tests)
+cmake --build buildmsvc-release --target cleanup
+```

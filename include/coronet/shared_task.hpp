@@ -121,7 +121,7 @@ public:
     template<typename U>
         requires std::is_convertible_v<U&&, T>
     void return_value(U&& value) noexcept(std::is_nothrow_constructible_v<T, U&&>) {
-        new (&storage_) T(std::forward<U>(value));
+        std::construct_at(reinterpret_cast<T*>(&storage_), std::forward<U>(value));
     }
 
     T& result() {

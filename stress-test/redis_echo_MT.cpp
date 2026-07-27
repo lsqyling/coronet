@@ -24,7 +24,7 @@ constexpr int BufSize        = 4096;
 
 /// Per-session coroutine — recv / send PONG in a loop
 coronet::task<> redis_session(int sockfd) {
-    coronet::socket sock{sockfd};
+    coronet::tcp_socket sock{sockfd};
     char buf[BufSize];
     constexpr const char* pong     = "+PONG\r\n";
     constexpr int         pong_len = 7;
@@ -41,7 +41,7 @@ coronet::task<> redis_session(int sockfd) {
 coronet::task<> acceptor_task(uint16_t port,
                               std::vector<coronet::io_context>& workers,
                               int nworkers) {
-    coronet::acceptor ac{coronet::inet_address{port}};
+    coronet::tcp_acceptor ac{coronet::inet_address{port}};
     std::fprintf(stderr, "[coronet MT] listening on port %d (%d workers)\n",
                  port, nworkers);
     std::fflush(stderr);

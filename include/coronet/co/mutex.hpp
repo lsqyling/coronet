@@ -1,6 +1,5 @@
 #pragma once
 
-#include "coronet/detail/io_context_meta.hpp"
 #include "coronet/detail/lock_guard.hpp"
 #include "coronet/detail/thread_meta.hpp"
 

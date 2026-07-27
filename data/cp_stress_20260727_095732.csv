@@ -1,0 +1,2 @@
+Source,Destination,Size_GB,Chunk_MB,Copy_ms,Copy_MBps,Verify_ms,Verify_OK,Chunks_Copied,Chunks_Verified,CPU_pct,Avg_Mem_MB,Peak_Mem_MB
+D:/Users/10580/Desktop/windows_10_professional_x64_2026.iso,D:/dev/Downloads/windows_10_professional_x64_2026.iso,4.90691,4,55680,90.2421,36607,YES,1257,1257,11.5599,11,15

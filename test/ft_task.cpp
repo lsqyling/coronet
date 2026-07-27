@@ -43,12 +43,63 @@ using namespace coronet;
 #define TEST_PASS() std::printf("  PASS\n")
 
 // ============================================================
+// Coroutine helper functions (replacing coroutine lambdas)
+// C++20 标准推荐使用协程函数而非协程 lambda
+// ============================================================
+
+/// 返回指定值的 task<int> 协程
+task<int> make_task_int(int v) { co_return v; }
+
+/// 返回指定字符串的 task<std::string> 协程
+task<std::string> make_task_string(const char* s) { co_return std::string(s); }
+
+/// 空 task<void> 协程
+task<> make_task_void() { co_return; }
+
+/// 设置 flag 的 task<void> 协程
+task<> set_flag(bool& flag) {
+    flag = true;
+    co_return;
+}
+
+/// 返回变量引用的 task<int&> 协程
+task<int&> make_task_ref(int& v) { co_return v; }
+
+/// 抛出 runtime_error 的 task<int> 协程
+task<int> throw_runtime_int(const char* msg) {
+    throw std::runtime_error(msg);
+    co_return 0;
+}
+
+/// 抛出 logic_error 的 task<void> 协程
+/// FIX: 添加 co_return; — C++ 标准要求协程必须包含 co_return/co_await/co_yield。
+/// 旧代码缺少 co_return，按标准不是协程（MSVC 做了扩展但行为不确定）。
+task<> throw_logic_void(const char* msg) {
+    throw std::logic_error(msg);
+    co_return;  // unreachable but required for standard compliance
+}
+
+/// 内层协程（返回 10）
+task<int> inner_value() { co_return 10; }
+
+/// 链式协程：co_await 内层协程并加 5
+task<int> chained_value() {
+    auto inner = inner_value();
+    co_return co_await inner + 5;
+}
+
+// ============================================================
 // Helper: run a test coroutine inside an io_context
 // ============================================================
 //
 // 测试辅助函数：在 io_context 事件循环中执行协程。
-// 所有需要协程上下文的测试都通过此函数运行。
-// io_context 是 coronet 的事件循环调度器，它管理协程的唤醒和调度。
+//
+// DESIGN NOTE: can_stop() 在 start() 后立即调用，事件循环主循环不执行。
+// 测试协程在 drain_residual_coroutines() 排空阶段运行。
+// 这对同步协程（co_await 同步任务）有效，因为排空阶段会 resume 协程。
+// 对异步协程（co_await async::timeout 等需 I/O 完成的）无效，
+// 因为排空阶段不处理 I/O 完成（do_completion_part 不被调用）。
+// 所有 ft_task 测试都是同步的，所以此模式可用。
 template<typename F>
 static void run_test(F func) {
     io_context ctx;
@@ -64,7 +115,7 @@ static void run_test(F func) {
 //
 // 测试 task<T> 的构造和移动语义（不需要 io_context，因为是纯构造操作）：
 //   1. 默认构造：构造空的 task，get_handle() 应返回空
-//   2. 移动构造：通过立即调用的 lambda 协程创建 task，
+//   2. 移动构造：通过协程函数创建 task，
 //      然后移动构造到另一个 task 对象。源对象变为空。
 //   3. 编译时验证：复制构造函数被删除（尝试复制会导致编译错误）
 // 这些测试验证了 task 的唯一所有权语义。
@@ -77,9 +128,7 @@ static void test_construction() {
     TEST_PASS();
 
     // Move construction
-    task<int> t2 = []() -> task<int> {
-        co_return 42;
-    }();
+    task<int> t2 = make_task_int(42);
     task<int> t3(std::move(t2));
     assert(t3.get_handle());
     assert(!t2.get_handle());
@@ -101,7 +150,7 @@ static void test_construction() {
 task<> coro_move_assignment() {
     std::printf("=== Test: Move Assignment ===\n");
 
-    task<int> t1 = []() -> task<int> { co_return 100; }();
+    task<int> t1 = make_task_int(100);
     task<int> t2;
     t2 = std::move(t1);
     assert(t2.get_handle());
@@ -111,7 +160,7 @@ task<> coro_move_assignment() {
     TEST_PASS();
 
     // Self-assignment
-    task<int> t3 = []() -> task<int> { co_return 200; }();
+    task<int> t3 = make_task_int(200);
     t3 = std::move(t3);
     assert(t3.get_handle());
     TEST_PASS();
@@ -137,7 +186,7 @@ task<> coro_is_ready() {
     TEST_PASS();
 
     // After co_await, task is ready
-    task<int> t2 = []() -> task<int> { co_return 42; }();
+    task<int> t2 = make_task_int(42);
     assert(t2.get_handle());  // handle exists before co_await
     co_await t2;
     assert(t2.is_ready());
@@ -162,22 +211,23 @@ task<> coro_detach() {
     bool executed = false;
 
     // task<void> detach
-    task<> t1 = [&executed]() -> task<> {
-        executed = true;
-        co_return;
-    }();
+    task<> t1 = set_flag(executed);
     auto h1 = t1.get_handle();
     t1.detach();
     assert(!t1.get_handle());  // handle cleared after detach
     // Resume the detached handle so it runs to completion
     h1.resume();
     assert(executed);
+    // FIX: clean up the suspended frame (final_suspend leaves it suspended)
+    // Without this, the coroutine frame leaks (detached + at final_suspend = no owner)
+    if (h1.done()) h1.destroy();
     TEST_PASS();
 
-    // Non-void task detach
-    task<int> t2 = []() -> task<int> { co_return 999; }();
-    t2.detach();
-    assert(!t2.get_handle());
+    // Non-void task detach is intentionally disabled (compile-time constrained).
+    // task<T> (non-void) has a return value that must be consumed; detach would
+    // leak the coroutine frame. Use co_await instead.
+    // task<int> t2 = make_task_int(999);
+    // t2.detach();  // <-- would not compile: detach() requires std::is_void_v<T>
     TEST_PASS();
 
     std::printf("  detach() tests passed!\n\n");
@@ -197,8 +247,8 @@ task<> coro_detach() {
 task<> coro_swap() {
     std::printf("=== Test: swap() ===\n");
 
-    task<int> t1 = []() -> task<int> { co_return 10; }();
-    task<int> t2 = []() -> task<int> { co_return 20; }();
+    task<int> t1 = make_task_int(10);
+    task<int> t2 = make_task_int(20);
     swap(t1, t2);
     assert(t1.get_handle() && t2.get_handle());
     int r1 = co_await t1;
@@ -207,15 +257,15 @@ task<> coro_swap() {
     TEST_PASS();
 
     // Swap with empty
-    task<int> t3 = []() -> task<int> { co_return 30; }();
+    task<int> t3 = make_task_int(30);
     task<int> t4;
     swap(t3, t4);
     assert(!t3.get_handle() && t4.get_handle());
     TEST_PASS();
 
     // std::swap
-    task<int> t5 = []() -> task<int> { co_return 50; }();
-    task<int> t6 = []() -> task<int> { co_return 60; }();
+    task<int> t5 = make_task_int(50);
+    task<int> t6 = make_task_int(60);
     std::swap(t5, t6);
     int r5 = co_await t5;
     int r6 = co_await t6;
@@ -237,7 +287,7 @@ task<> coro_swap() {
 task<> coro_get_handle() {
     std::printf("=== Test: get_handle() ===\n");
 
-    task<int> t1 = []() -> task<int> { co_return 42; }();
+    task<int> t1 = make_task_int(42);
     auto handle = t1.get_handle();
     assert(handle);
     assert(!handle.done());
@@ -271,7 +321,7 @@ task<> coro_get_handle() {
 task<> coro_when_ready() {
     std::printf("=== Test: when_ready() ===\n");
 
-    task<int> t = []() -> task<int> { co_return 100; }();
+    task<int> t = make_task_int(100);
     co_await t.when_ready();
     assert(t.is_ready());
     TEST_PASS();
@@ -296,13 +346,13 @@ task<> coro_when_ready() {
 task<> coro_co_await_lvalue() {
     std::printf("=== Test: co_await (lvalue) ===\n");
 
-    task<int> t = []() -> task<int> { co_return 42; }();
+    task<int> t = make_task_int(42);
     int& result = co_await t;
     assert(result == 42);
     TEST_PASS();
 
     // task<void>
-    task<> tv = []() -> task<> { co_return; }();
+    task<> tv = make_task_void();
     co_await tv;
     TEST_PASS();
 
@@ -321,16 +371,12 @@ task<> coro_co_await_lvalue() {
 task<> coro_co_await_rvalue() {
     std::printf("=== Test: co_await (rvalue) ===\n");
 
-    int result = co_await []() -> task<int> {
-        co_return 99;
-    }();
+    int result = co_await make_task_int(99);
     assert(result == 99);
     TEST_PASS();
 
     // Complex type
-    task<std::string> t = []() -> task<std::string> {
-        co_return std::string("Hello, Task!");
-    }();
+    task<std::string> t = make_task_string("Hello, Task!");
     std::string str = co_await std::move(t);
     assert(str == "Hello, Task!");
     TEST_PASS();
@@ -351,7 +397,7 @@ task<> coro_reference_return() {
     std::printf("=== Test: Reference Return Type ===\n");
 
     int value = 42;
-    task<int&> t = [&value]() -> task<int&> { co_return value; }();
+    task<int&> t = make_task_ref(value);
     int& ref = co_await t;
     assert(ref == 42);
     assert(&ref == &value);
@@ -380,10 +426,7 @@ task<> coro_exception_handling() {
 
     // task<int> exception
     bool caught = false;
-    task<int> t1 = []() -> task<int> {
-        throw std::runtime_error("Test exception");
-        co_return 0;
-    }();
+    task<int> t1 = throw_runtime_int("Test exception");
     try {
         co_await t1;
     } catch (const std::runtime_error& e) {
@@ -395,9 +438,7 @@ task<> coro_exception_handling() {
 
     // task<void> exception
     caught = false;
-    task<> t2 = []() -> task<> {
-        throw std::logic_error("task<void> exception");
-    }();
+    task<> t2 = throw_logic_void("task<void> exception");
     try {
         co_await t2;
     } catch (const std::logic_error& e) {
@@ -425,19 +466,14 @@ task<> coro_comprehensive() {
     std::printf("=== Test: Comprehensive Scenarios ===\n");
 
     // Chained tasks
-    auto result = co_await []() -> task<int> {
-        auto inner = []() -> task<int> {
-            co_return 10;
-        }();
-        co_return co_await inner + 5;
-    }();
+    auto result = co_await chained_value();
     assert(result == 15);
     TEST_PASS();
 
     // Multiple concurrent tasks
-    task<int> t1 = []() -> task<int> { co_return 1; }();
-    task<int> t2 = []() -> task<int> { co_return 2; }();
-    task<int> t3 = []() -> task<int> { co_return 3; }();
+    task<int> t1 = make_task_int(1);
+    task<int> t2 = make_task_int(2);
+    task<int> t3 = make_task_int(3);
     int r1 = co_await t1;
     int r2 = co_await t2;
     int r3 = co_await t3;
@@ -445,8 +481,8 @@ task<> coro_comprehensive() {
     TEST_PASS();
 
     // Swap then await
-    task<int> a = []() -> task<int> { co_return 100; }();
-    task<int> b = []() -> task<int> { co_return 200; }();
+    task<int> a = make_task_int(100);
+    task<int> b = make_task_int(200);
     swap(a, b);
     int ra = co_await a;
     int rb = co_await b;

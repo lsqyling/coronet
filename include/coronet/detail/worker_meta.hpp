@@ -13,24 +13,11 @@
 
 #include "coronet/config/io_context.hpp"
 #include "coronet/detail/spsc_cursor.hpp"
-#include "coronet/detail/task_info.hpp"
-#include "coronet/platform/platform.hpp"
-
-// 编译期平台 Proactor 选择（零虚表分派）
-// Compile-time platform proactor selection (no virtual dispatch)
-#if defined(CORONET_PLATFORM_WINDOWS)
-#include "coronet/platform/iocp/iocp_proactor.hpp"
-namespace coronet::detail { using proactor_type = platform::iocp::iocp_proactor; }
-#elif defined(CORONET_USE_IOURING)
-#include "coronet/platform/io_uring/io_uring_proactor.hpp"
-namespace coronet::detail { using proactor_type = platform::io_uring::io_uring_proactor; }
-#else
-#include "coronet/platform/epoll/epoll_reactor.hpp"
-namespace coronet::detail { using proactor_type = platform::epoll::epoll_proactor; }
-#endif
+// 平台 Proactor：通过桥接头集中选择（同时带入 platform.hpp）
+// Platform proactor: selected via the proactor_selector bridge (also brings in platform.hpp)
+#include "coronet/platform/proactor_selector.hpp"
 
 #include <coroutine>
-#include <array>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -39,41 +26,43 @@ namespace coronet::detail {
 
 /// 每个 worker（每个 io_context）的调度状态。
 /// 包含 Proactor 指针、SPSC 环、跨线程队列和 I/O 计数器。
+///
+/// 缓存布局设计（hot/cold separation）：
+/// - 热数据（proactor, 计数器, SPSC 环）放在结构体头部，事件循环每轮访问
+/// - 冷数据（cross_mtx, cross_queue）用 alignas 隔离到独立缓存行
+/// - 这样跨线程 co_spawn 获取 cross_mtx 时不会导致热数据缓存行失效
 struct worker_meta {
-    // ---- 平台 Proactor（具体类型指针，零虚表分派） ----
-    // the platform proactor (concrete type, no virtual dispatch)
-    proactor_type* proactor{nullptr};
+    // ---- 热数据：事件循环每轮访问 ----
+    // Hot data: accessed every event loop iteration.
+    // Placed first for best cache locality.
+    alignas(config::cache_line_size)
+    platform::proactor_type* proactor{nullptr};
 
-    // ---- reap_swap：同线程协程句柄 SPSC 无锁环 ----
+    // requests_to_reap:   inflight ops count (await +1, completion -1)
+    // requests_to_submit: pending batch submissions (poll_submission resets)
+    int32_t  requests_to_reap   = 0;
+    uint32_t requests_to_submit = 0;
+
+    config::ctx_id_t ctx_id{0};
+
+    // ---- SPSC 环：同线程协程调度（热，仅事件循环线程访问）----
+    // Same-thread coroutine scheduling ring (hot, single-thread only).
     // 用 vector 堆分配，避免多个 io_context 实例时栈溢出
     // （每个实例 = config::swap_capacity * 8 bytes ≈ 131KB）
-    //
-    // Heap-allocated via vector to avoid stack overflow with multiple
-    // io_context instances (each is config::swap_capacity * 8 bytes ≈ 131KB).
     std::vector<std::coroutine_handle<>> reap_swap{config::swap_capacity};
 
     // SPSC 环游标（生产者/消费者指针）
     spsc_cursor<config::cur_t, config::swap_capacity> reap_cur;
 
-    // ---- 跨线程生成队列（互斥锁保护） ----
+    // ---- 冷数据：仅跨线程 co_spawn 访问 ----
+    // Cold data: only accessed during cross-thread co_spawn.
+    // alignas ensures cold data starts on a fresh cache line,
+    // preventing false sharing with hot counters above.
     // 当其他线程调用 co_spawn_auto 时，句柄进入此队列，
     // 然后通过 eventfd / PostQueuedCompletionStatus 唤醒本 worker。
-    //
-    // cross-thread spawn queue (mutex-protected).
-    // When another thread calls co_spawn_auto, handles land here
-    // and the worker is woken via eventfd / PostQueuedCompletionStatus.
     alignas(config::cache_line_size)
     std::mutex cross_mtx;
     std::vector<std::coroutine_handle<>> cross_queue;
-
-    // ---- I/O 提交追踪 ----
-    // requests_to_reap：   待收割的 inflight 操作数（每次 await 构造 +1，完成时 -1）
-    // requests_to_submit： 待提交的批处理操作数（每次 await 构造 +1，poll_submission 清零）
-    int32_t  requests_to_reap   = 0;
-    uint32_t requests_to_submit = 0;
-
-    // ---- 身份标识 ----
-    config::ctx_id_t ctx_id{0};
 
     // ---- 生命周期 / lifecycle ----
     void init(uint32_t entries);
@@ -96,7 +85,9 @@ struct worker_meta {
     /// 从 SPSC 环弹出一个就绪协程句柄（消费者）
     std::coroutine_handle<> schedule() noexcept;
 
-    /// 将协程句柄推入 SPSC 环（生产者）
+    /// 将协程句柄推入 SPSC 环（生产者操作）。
+    /// P2-4: SPSC 环使用非原子操作，仅可从事件循环线程调用。
+    /// Debug 断言会检测跨线程误用。
     void forward_task(std::coroutine_handle<> handle) noexcept;
 
     /// 取出一个就绪协程并恢复执行

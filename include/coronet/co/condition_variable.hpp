@@ -2,7 +2,6 @@
 
 #include "coronet/co/mutex.hpp"
 #include "coronet/detail/spinlock.hpp"
-#include "coronet/detail/thread_meta.hpp"
 #include "coronet/detail/trivial_task.hpp"
 
 #include <atomic>

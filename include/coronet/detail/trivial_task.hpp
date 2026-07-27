@@ -2,7 +2,6 @@
 
 #include <coroutine>
 #include "coronet/detail/thread_meta.hpp"
-#include "coronet/detail/worker_meta.hpp"
 
 namespace coronet::detail {
 
@@ -42,6 +41,30 @@ public:
     explicit trivial_task(std::coroutine_handle<promise_type> self_handle) noexcept
         : handle(self_handle) {}
 
+    // P0-1 fix: 析构时销毁协程帧。
+    // final_awaiter::await_suspend 返回 void，将帧留在 final suspend 点。
+    // 此时 handle.done() == true，调用 destroy() 安全。
+    // 若协程从未启动（initial_suspend 挂起），destroy() 也安全。
+    //
+    // Destroy the coroutine frame on destruction.
+    // final_awaiter returns void, leaving the frame at final-suspend point.
+    // handle.done() == true at that point, so destroy() is safe.
+    // If the coroutine was never started (suspended at initial_suspend),
+    // destroy() is also safe.
+    ~trivial_task() {
+        if (handle) handle.destroy();
+    }
+
+    // Move semantics: nullify source to prevent double-destroy
+    // 移动语义：源对象置空，防止双重销毁
+    trivial_task(trivial_task&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+    trivial_task& operator=(trivial_task&&) = delete;  // no assignment needed
+
+    trivial_task(const trivial_task&) = delete;
+    trivial_task& operator=(const trivial_task&) = delete;
+
     /*
      * final_awaiter：协程即将结束时执行的操作。
      * await_suspend 的逻辑：
@@ -78,20 +101,19 @@ public:
         static void
         await_suspend(std::coroutine_handle<promise_type> current) noexcept {
             auto continuation = current.promise().parent_coro;
-            // 调度父协程恢复（直接使用 forward_task 避免循环依赖）
-            // 不在 await_suspend 中调用 current.destroy()，
-            // 以避免 MSVC 运行时在 await_suspend 返回后访问已释放帧
+            // 调度父协程恢复：通过 thread_meta 的自由函数，避免 include
+            // worker_meta.hpp（trivial_task 保持轻量，不拖入调度器完整定义）。
+            // 不在 await_suspend 中调用 current.destroy()，以避免 MSVC 运行时
+            // 在 await_suspend 返回后访问已释放帧。
             //
-            // Schedule parent resumption via forward_task (avoids
-            // circular include of io_context.hpp). Do NOT call
-            // current.destroy() here — MSVC's runtime may access
-            // the frame after await_suspend returns.
-            auto* w = coronet::detail::this_thread.worker;
-            if (w) {
-                w->forward_task(continuation);
-            }
-            // 当前帧生命周期由调用方管理
-            // Current frame lifetime managed by the caller
+            // Schedule parent resumption via the thread_meta helper so
+            // trivial_task need not include worker_meta.hpp. Do NOT call
+            // current.destroy() here — MSVC's runtime may access the
+            // frame after await_suspend returns.
+            coronet::detail::schedule_on_this_thread(continuation);
+            // 帧在 final suspend 点保持存活，由 trivial_task 析构函数销毁。
+            // Frame stays alive at final-suspend point, destroyed by
+            // trivial_task's destructor (which calls handle.destroy()).
         }
 
         static constexpr void await_resume() noexcept {}

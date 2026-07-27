@@ -8,7 +8,7 @@ static_assert(worker_num > 0);
 io_context worker[worker_num], balancer;
 
 task<> session(int sockfd) {
-    coronet::socket sock{sockfd};
+    coronet::tcp_socket sock{sockfd};
     char buf[8192];
     int nr = co_await sock.recv(buf);
 
@@ -18,7 +18,7 @@ task<> session(int sockfd) {
 }
 
 task<> server(const uint16_t port) {
-    acceptor ac{inet_address{port}};
+    tcp_acceptor ac{inet_address{port}};
     uint32_t turn = 0;
     for (int sock; (sock = co_await ac.accept()) >= 0;) {
         worker[turn].co_spawn(session(sock));

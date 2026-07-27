@@ -1,5 +1,6 @@
 #pragma once
 
+#include "coronet/config/io_context.hpp"
 #include <atomic>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -43,7 +44,11 @@ namespace coronet::detail {
 /// A simple spinlock using std::atomic_flag.
 /// Intended for short critical sections only; never block inside a spinlock.
 /// 适用于短临界区，切勿在持有自旋锁时执行阻塞操作。
-class spinlock {
+///
+/// alignas(cache_line_size): prevents multiple spinlock instances from
+/// sharing a cache line (false sharing). When two spinlocks on different
+/// threads share a cache line, acquiring one invalidates the other's cache.
+class alignas(config::cache_line_size) spinlock {
     std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
 
 public:
