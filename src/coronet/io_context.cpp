@@ -21,7 +21,6 @@
 #include <mutex>
 #endif
 
-#include <cstdio>
 #include <cstdlib>
 
 namespace coronet {
@@ -37,7 +36,7 @@ namespace {
     void init_winsock() {
         WSADATA wsa;
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            std::fprintf(stderr, "FATAL: WSAStartup failed\n");
+            log::e("FATAL: WSAStartup failed\n");
             std::abort();
         }
     }
