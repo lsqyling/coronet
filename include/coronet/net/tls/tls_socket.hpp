@@ -293,8 +293,6 @@ public:
             ssl_ = nullptr;
         }
 
-        // MSVC 对 co_await + [[nodiscard]] 有误报（C4834），抑制此行
-#pragma warning(suppress: 4834)
         co_await tcp_.close();
     }
 
@@ -342,7 +340,6 @@ public:
             ssl_ = nullptr;
         }
 
-#pragma warning(suppress: 4834)
         co_await tcp_.close();
     }
 

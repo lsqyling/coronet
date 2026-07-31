@@ -155,13 +155,16 @@ task<> coro_move_assignment() {
     t2 = std::move(t1);
     assert(t2.get_handle());
     assert(!t1.get_handle());
-    int result = co_await t2;
+    [[maybe_unused]] int result = co_await t2;
     assert(result == 100);
     TEST_PASS();
 
-    // Self-assignment
+    // Self-assignment (intentional, verify no-op)
     task<int> t3 = make_task_int(200);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
     t3 = std::move(t3);
+#pragma GCC diagnostic pop
     assert(t3.get_handle());
     TEST_PASS();
 
@@ -251,8 +254,8 @@ task<> coro_swap() {
     task<int> t2 = make_task_int(20);
     swap(t1, t2);
     assert(t1.get_handle() && t2.get_handle());
-    int r1 = co_await t1;
-    int r2 = co_await t2;
+    [[maybe_unused]] int r1 = co_await t1;
+    [[maybe_unused]] int r2 = co_await t2;
     assert(r1 == 20 && r2 == 10);
     TEST_PASS();
 
@@ -267,8 +270,8 @@ task<> coro_swap() {
     task<int> t5 = make_task_int(50);
     task<int> t6 = make_task_int(60);
     std::swap(t5, t6);
-    int r5 = co_await t5;
-    int r6 = co_await t6;
+    [[maybe_unused]] int r5 = co_await t5;
+    [[maybe_unused]] int r6 = co_await t6;
     assert(r5 == 60 && r6 == 50);
     TEST_PASS();
 
@@ -288,14 +291,14 @@ task<> coro_get_handle() {
     std::printf("=== Test: get_handle() ===\n");
 
     task<int> t1 = make_task_int(42);
-    auto handle = t1.get_handle();
+    [[maybe_unused]] auto handle = t1.get_handle();
     assert(handle);
     assert(!handle.done());
     TEST_PASS();
 
     // const correctness
     const task<int>& t1_ref = t1;
-    auto const_handle = t1_ref.get_handle();
+    [[maybe_unused]] auto const_handle = t1_ref.get_handle();
     assert(const_handle == handle);
     TEST_PASS();
 
@@ -347,7 +350,7 @@ task<> coro_co_await_lvalue() {
     std::printf("=== Test: co_await (lvalue) ===\n");
 
     task<int> t = make_task_int(42);
-    int& result = co_await t;
+    [[maybe_unused]] int& result = co_await t;
     assert(result == 42);
     TEST_PASS();
 
@@ -371,7 +374,7 @@ task<> coro_co_await_lvalue() {
 task<> coro_co_await_rvalue() {
     std::printf("=== Test: co_await (rvalue) ===\n");
 
-    int result = co_await make_task_int(99);
+    [[maybe_unused]] int result = co_await make_task_int(99);
     assert(result == 99);
     TEST_PASS();
 
@@ -425,7 +428,7 @@ task<> coro_exception_handling() {
     std::printf("=== Test: Exception Handling ===\n");
 
     // task<int> exception
-    bool caught = false;
+    [[maybe_unused]] bool caught = false;
     task<int> t1 = throw_runtime_int("Test exception");
     try {
         co_await t1;
@@ -466,7 +469,7 @@ task<> coro_comprehensive() {
     std::printf("=== Test: Comprehensive Scenarios ===\n");
 
     // Chained tasks
-    auto result = co_await chained_value();
+    [[maybe_unused]] auto result = co_await chained_value();
     assert(result == 15);
     TEST_PASS();
 
@@ -474,9 +477,9 @@ task<> coro_comprehensive() {
     task<int> t1 = make_task_int(1);
     task<int> t2 = make_task_int(2);
     task<int> t3 = make_task_int(3);
-    int r1 = co_await t1;
-    int r2 = co_await t2;
-    int r3 = co_await t3;
+    [[maybe_unused]] int r1 = co_await t1;
+    [[maybe_unused]] int r2 = co_await t2;
+    [[maybe_unused]] int r3 = co_await t3;
     assert(r1 + r2 + r3 == 6);
     TEST_PASS();
 
@@ -484,8 +487,8 @@ task<> coro_comprehensive() {
     task<int> a = make_task_int(100);
     task<int> b = make_task_int(200);
     swap(a, b);
-    int ra = co_await a;
-    int rb = co_await b;
+    [[maybe_unused]] int ra = co_await a;
+    [[maybe_unused]] int rb = co_await b;
     assert(ra == 200 && rb == 100);
     TEST_PASS();
 

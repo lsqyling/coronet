@@ -143,7 +143,7 @@ public:
     void init(uint32_t entries);
     void deinit() noexcept;
     int  submit(bool wait = false) noexcept;
-    int  wait_completion(completion_info* info) noexcept;
+    int  wait_completion(completion_info* info, bool nonblocking = false) noexcept;
     intptr_t native_handle() const noexcept;
     void wakeup() noexcept;
 

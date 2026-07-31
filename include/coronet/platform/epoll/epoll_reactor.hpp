@@ -157,7 +157,8 @@ public:
     /// 提交：调用 epoll_wait 预取就绪事件到内部队列
     int  submit(bool wait = false) noexcept;
     /// 等待完成：从内部队列取出一个事件 → 执行 I/O syscall → 填充 completion_info
-    int  wait_completion(completion_info* info) noexcept;
+    /// nonblocking=true: epoll_wait 不阻塞（timeout=0）
+    int  wait_completion(completion_info* info, bool nonblocking = false) noexcept;
     /// 返回 epoll fd（用于外部集成）
     intptr_t native_handle() const noexcept { return epfd_; }
 

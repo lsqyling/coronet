@@ -126,7 +126,10 @@ TEST(TaskTest, MoveAssign) {
 
 TEST(TaskTest, SelfMoveAssign) {
     auto t = make_value(42);
-    t = std::move(t);  // should be a no-op
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
+    t = std::move(t);  // intentional self-move, should be no-op
+#pragma GCC diagnostic pop
     EXPECT_FALSE(t.is_ready());  // still valid
 }
 
@@ -270,7 +273,7 @@ TEST(TaskTest, DetachVoid) {
 // ============================================================
 
 task<void> coro_await_rvalue() {
-    int result = co_await make_value(99);
+    [[maybe_unused]] int result = co_await make_value(99);
     assert(result == 99);
 
     std::string s = co_await make_string("rvalue");
@@ -290,8 +293,8 @@ task<void> coro_swap() {
     task<int> t1 = make_value(10);
     task<int> t2 = make_value(20);
     swap(t1, t2);
-    int r1 = co_await t1;
-    int r2 = co_await t2;
+    [[maybe_unused]] int r1 = co_await t1;
+    [[maybe_unused]] int r2 = co_await t2;
     assert(r1 == 20 && r2 == 10);
     co_return;
 }

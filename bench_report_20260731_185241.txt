@@ -1,0 +1,26 @@
+============================================================
+  Coronet vs ASIO C1000K Benchmark
+============================================================
+  Date:     Fri Jul 31 18:52:41 CST 2026
+  Requests: 1000000
+  Clients:  1000
+  Pipeline: 1 (no pipelining)
+  Build:    /home/shiqing/workspace/coronet/build
+============================================================
+
+[0;36m=== Round 1: Single-Threaded ===[0m
+
+  coronet_ST                [port 16500] [0;32mPASS[0m  rps=41929  cpu=50.0%  mem=15MB  time=49.8s
+  coronet_chain             [port 16501] [0;32mPASS[0m  rps=40987  cpu=50.0%  mem=16MB  time=47.7s
+  ASIO_ST                   [port 16502] [0;32mPASS[0m  rps=44895  cpu=50.0%  mem=8MB  time=46.4s
+
+[0;36m=== Round 2: Multi-Threaded (6 threads) ===[0m
+
+  coronet_MT(6)             [port 16510] [0;32mPASS[0m  rps=30936  cpu=50.0%  mem=35MB  time=63.5s
+  ASIO_MT(6)                [port 16511] [0;32mPASS[0m  rps=35677  cpu=110.0%  mem=9MB  time=57.1s
+
+============================================================
+  Report: bench_report_20260731_185241.txt
+  CSV:    bench_report_20260731_185241.csv
+============================================================
+Benchmark complete.

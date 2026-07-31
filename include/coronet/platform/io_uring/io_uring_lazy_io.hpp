@@ -1,10 +1,5 @@
 #pragma once
 
-#ifdef __GNUC__
-#pragma GCC push_macro("linux")
-#undef linux
-#endif
-
 #include "coronet/detail/task_info.hpp"
 #include "coronet/detail/thread_meta.hpp"
 #include "coronet/detail/worker_meta.hpp"
@@ -287,7 +282,3 @@ namespace coronet::detail::platform_io {
     inline auto make_timeout(D dur) noexcept
         { return io_uring_timeout{dur}; }
 } // namespace coronet::detail::platform_io
-
-#ifdef __GNUC__
-#pragma GCC pop_macro("linux")
-#endif

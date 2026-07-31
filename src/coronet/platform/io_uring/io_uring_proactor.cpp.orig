@@ -1,3 +1,8 @@
+#ifdef __GNUC__
+#pragma GCC push_macro("linux")
+#undef linux
+#endif
+
 #include "coronet/platform/io_uring/io_uring_proactor.hpp"
 #include "coronet/log/log.hpp"
 
@@ -14,14 +19,10 @@ void io_uring_proactor::init(uint32_t entries) {
     if (initialized_) return;
     log::d("[uring] init(entries=%u)\n", entries);
     entries_ = entries;
+    ring_.init(entries);
+    log::d("[uring] init done, fd=%d\n", ring_.fd());
 
-    // ring_.init() 延迟到 lazy_init_ring() 中在事件循环线程调用，
-    // 以遵守 IORING_SETUP_SINGLE_ISSUER 约束（kernel >= 6.0 要求
-    // io_uring_setup 和 io_uring_enter 在同一线程）。
-    // ring_.init() is deferred to lazy_init_ring() on the event loop thread
-    // to comply with IORING_SETUP_SINGLE_ISSUER (kernel >= 6.0).
-
-    // 创建 eventfd 用于跨线程唤醒
+    // Create eventfd for cross-thread wakeup
     // 创建 eventfd 用于跨线程唤醒
     // eventfd 是 Linux 提供的一种轻量级事件通知机制，可以在进程内部或进程之间传递事件信号。
     // 在这里的用途是：当另一个线程通过 cross_thread_queue 提交协程到本线程时，
@@ -31,31 +32,16 @@ void io_uring_proactor::init(uint32_t entries) {
     if (event_fd_ >= 0) {
         eventfd_user_data_ = static_cast<uint64_t>(-1); // marker
         // 使用全 1 作为标记值，这样在 CQE 中通过 user_data 可以唯一识别 eventfd 事件
-        // arm_eventfd() 延迟到 lazy_init_ring() 中调用（需要 ring 已初始化）
-        log::d("[uring] eventfd=%d created (arming deferred)\n", event_fd_);
+        // NOTE: arm_eventfd() is deferred to the event loop thread (run()).
+        // Calling submit() here would violate IORING_SETUP_SINGLE_ISSUER
+        // (io_uring_enter from constructor's thread vs event loop thread).
+        // Aligned with co_context: listen_on_co_spawn() is called from run().
+        // arm_eventfd() 延迟到事件循环线程调用，避免 SINGLE_ISSUER 线程冲突。
+        // 与 co_context 对齐：listen_on_co_spawn() 在 run() 中调用。
+        log::d("[uring] eventfd=%d created (not yet armed)\n", event_fd_);
     }
 
     initialized_ = true;
-}
-
-void io_uring_proactor::lazy_init_ring() {
-    if (ring_initialized_) return;
-    ring_.init(entries_);
-    ring_initialized_ = true;
-    log::d("[uring] lazy_init_ring done, fd=%d\n", ring_.fd());
-
-    // ring 初始化完成后立即 arm eventfd，确保跨线程唤醒可用
-    // Arm eventfd immediately after ring init so cross-thread wakeup works.
-    if (event_fd_ >= 0) {
-        arm_eventfd();
-        log::d("[uring] eventfd=%d armed\n", event_fd_);
-    }
-}
-
-bool io_uring_proactor::has_completion() noexcept {
-    const liburingcxx::cq_entry* cqe = nullptr;
-    ring_.peek_cq_entry(cqe);
-    return cqe != nullptr;
 }
 
 void io_uring_proactor::arm_eventfd() {
@@ -67,8 +53,10 @@ void io_uring_proactor::arm_eventfd() {
     // 这样就可以在 wait_completion 中统一处理 I/O 完成和跨线程唤醒，不用额外的 epoll/poll。
     // dummy 是一个栈上变量，但在实际使用中 eventfd 的读操作是异步的，
     // 内核在读取时不需要保留用户缓冲区（eventfd 数据在内核中），这里只是为了占位。
+    // offset = uint64_t(-1) means "use current file position" — required for
+    // non-seekable fds like eventfd.
     static uint64_t dummy = 0;
-    sqe->prep_read(event_fd_, std::span<char>{reinterpret_cast<char*>(&dummy), sizeof(dummy)}, 0);
+    sqe->prep_read(event_fd_, std::span<char>{reinterpret_cast<char*>(&dummy), sizeof(dummy)}, uint64_t(-1));
     sqe->set_data(eventfd_user_data_);
     ring_.submit();
 }
@@ -79,14 +67,10 @@ void io_uring_proactor::deinit() noexcept {
             ::close(event_fd_);
             event_fd_ = -1;
         }
-        // 仅在 ring 已初始化时才析构（lazy_init_ring 可能未被调用）
-        // Only destroy the ring if it was initialized (lazy_init_ring may not
-        // have been called, e.g. if start() was never invoked).
-        if (ring_initialized_) {
-            ring_.~io_uring_ring();
-            std::construct_at(&ring_);
-            ring_initialized_ = false;
-        }
+        eventfd_armed_ = false;
+        // 显式调用析构函数然后 placement new 重建，相当于 clear + reset 的效果
+        ring_.~io_uring_ring();
+        std::construct_at(&ring_);
         initialized_ = false;
     }
 }
@@ -125,10 +109,11 @@ int io_uring_proactor::submit(bool wait) noexcept {
     return ret;
 }
 
-int io_uring_proactor::wait_completion(completion_info* info) noexcept {
+int io_uring_proactor::wait_completion(completion_info* info, bool nonblocking) noexcept {
     // wait_completion 的核心流程：
     //   1. 尝试从 CQ（完成队列）中 peek 一个 CQE
     //   2. 如果队列为空，则调用 submit(true) 阻塞等待内核处理并返回完成事件
+    //      nonblocking=true 时不阻塞，直接返回 0
     //   3. 从 CQE 中提取结果（user_data, res, flags）
     //   4. 如果是 eventfd 的 CQE，则重新 arm eventfd 并返回 0 通知上层排空跨线程队列
     //   5. 如果不是，则填充 completion_info 并前进 CQ 游标
@@ -139,6 +124,9 @@ int io_uring_proactor::wait_completion(completion_info* info) noexcept {
     int ret = ring_.peek_cq_entry(cqe_ptr);
     log::v("[uring] wait_completion: peek=%d cqe=%p\n", ret, (void*)cqe_ptr);
     if (ret != 0 || cqe_ptr == nullptr) {
+        if (nonblocking) {
+            return 0;  // nonblocking: don't wait, just return
+        }
         log::v("[uring] no CQE ready, calling submit(true)\n");
         submit(true);
         ret = ring_.peek_cq_entry(cqe_ptr);
@@ -176,6 +164,17 @@ void io_uring_proactor::wakeup() noexcept {
         uint64_t val = 1;
         (void)::write(event_fd_, &val, sizeof(val));
     }
+}
+
+bool io_uring_proactor::has_completion() noexcept {
+    const liburingcxx::cq_entry* cqe = nullptr;
+    ring_.peek_cq_entry(cqe);
+    return cqe != nullptr;
+}
+
+void io_uring_proactor::wait_cqe() noexcept {
+    const liburingcxx::cq_entry* cqe = nullptr;
+    ring_.wait_cq_entry(cqe);
 }
 
 intptr_t io_uring_proactor::native_handle() const noexcept {
@@ -218,3 +217,7 @@ int io_uring_proactor::poll_completions_impl(
 }
 
 } // namespace coronet::platform::io_uring
+
+#ifdef __GNUC__
+#pragma GCC pop_macro("linux")
+#endif

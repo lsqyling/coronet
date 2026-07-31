@@ -99,20 +99,41 @@ static std::filesystem::path get_exe_dir() {
 #endif
     return std::filesystem::current_path();
 }
+/// Ensure a file exists and is executable. If it exists but lacks +x, add it.
+/// 确保文件存在且可执行。若存在但缺少执行权限则自动添加。
+static bool ensure_executable(const std::filesystem::path& p) {
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec)) return false;
+    auto perms = std::filesystem::status(p).permissions();
+    bool has_x = (perms & std::filesystem::perms::owner_exec)  != std::filesystem::perms::none ||
+                 (perms & std::filesystem::perms::group_exec)   != std::filesystem::perms::none ||
+                 (perms & std::filesystem::perms::others_exec)  != std::filesystem::perms::none;
+    if (!has_x) {
+        // 自动添加 owner/group/other 执行位
+        std::filesystem::permissions(p,
+            std::filesystem::perms::owner_exec  |
+            std::filesystem::perms::group_exec  |
+            std::filesystem::perms::others_exec,
+            std::filesystem::perm_options::add, ec);
+        if (ec) return false;
+    }
+    return true;
+}
+
 static bool has_redis_benchmark() {
     // 1) 优先查找项目自带 redis tools (coronet/redistools/)
     auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-benchmark";
 #ifdef _WIN32
     redistools += ".exe";
 #endif
-    if (std::filesystem::exists(redistools)) return true;
+    if (ensure_executable(redistools)) return true;
 
     // 2) 查找同目录
     auto local = get_exe_dir() / "redis-benchmark";
 #ifdef _WIN32
     local += ".exe";
 #endif
-    if (std::filesystem::exists(local)) return true;
+    if (ensure_executable(local)) return true;
 
     // 3) 查找系统 PATH
 #ifdef _WIN32
@@ -131,13 +152,13 @@ static std::string find_redis_benchmark() {
 #ifdef _WIN32
     redistools += ".exe";
 #endif
-    if (std::filesystem::exists(redistools)) return redistools.string();
+    if (ensure_executable(redistools)) return redistools.string();
 
     auto local = get_exe_dir() / "redis-benchmark";
 #ifdef _WIN32
     local += ".exe";
 #endif
-    if (std::filesystem::exists(local)) return local.string();
+    if (ensure_executable(local)) return local.string();
 
     return "redis-benchmark";  // fallback: rely on PATH
 }
@@ -147,13 +168,13 @@ static std::string find_redis_cli() {
 #ifdef _WIN32
     redistools += ".exe";
 #endif
-    if (std::filesystem::exists(redistools)) return redistools.string();
+    if (ensure_executable(redistools)) return redistools.string();
 
     auto local = get_exe_dir() / "redis-cli";
 #ifdef _WIN32
     local += ".exe";
 #endif
-    if (std::filesystem::exists(local)) return local.string();
+    if (ensure_executable(local)) return local.string();
 
     return "redis-cli";
 }

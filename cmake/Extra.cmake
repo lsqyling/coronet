@@ -3,19 +3,43 @@
 # ============================================================
 
 # ---- liburingcxx (only when CORONET_IOURING=ON) ----
+# 策略：优先使用系统 liburingcxx，找不到则 FetchContent 下载。
+# 对齐 OpenSSL 的处理逻辑。
 if(CORONET_IOURING)
+    # 1. 优先使用系统已安装的 liburingcxx
     find_package(liburingcxx QUIET)
     if(liburingcxx_FOUND)
         target_link_libraries(coronet PUBLIC liburingcxx::liburingcxx)
         message(STATUS "coronet: using external liburingcxx")
     else()
-        if(EXISTS "${PROJECT_SOURCE_DIR}/extern/liburingcxx/CMakeLists.txt")
-            add_subdirectory(extern/liburingcxx)
-            target_link_libraries(coronet PUBLIC liburingcxx::liburingcxx)
-            message(STATUS "coronet: using bundled liburingcxx")
-        else()
-            message(FATAL_ERROR "coronet: CORONET_IOURING=ON but liburingcxx not found")
-        endif()
+        # 2. Fallback: FetchContent 从 GitHub 下载
+        message(STATUS "coronet: liburingcxx not found, trying FetchContent...")
+        include(FetchContent)
+        FetchContent_Declare(
+            liburingcxx
+            GIT_REPOSITORY https://github.com/Codesire-Deng/liburingcxx.git
+            GIT_TAG        main
+            GIT_SHALLOW    TRUE
+            # coronet: disable IORING_ENTER_REGISTERED_RING (incompatible with WSL2)
+            # This prevents io_uring_enter() from returning EINVAL on WSL2 kernels.
+            # The liburingcxx config hardcodes this flag for kernel >= 5.18, but WSL2's
+            # io_uring implementation does not support it.
+            # Also removes deprecated <cstdbool> include (triggers -Wcpp on GCC 15+).
+            # 同时移除已废弃的 <cstdbool> 头文件（GCC 15+ 触发 -Wcpp 警告）。
+            PATCH_COMMAND sed -i
+                -e "s/using_register_ring_fd = is_kernel_reach(5, 18)/using_register_ring_fd = false/"
+                include/uring/uring.hpp
+                &&
+                sed -i "/#include <cstdbool>/d" include/uring/syscall.hpp
+        )
+        FetchContent_MakeAvailable(liburingcxx)
+        target_link_libraries(coronet PUBLIC liburingcxx::liburingcxx)
+        # 将 liburingcxx 加入 coronet_targets 导出集
+        # FetchContent 创建的是本地 target，不在导出集中会导致：
+        #   install(EXPORT "coronet_targets" ...) includes target "coronet"
+        #   which requires target "liburingcxx" that is not in any export set.
+        install(TARGETS liburingcxx EXPORT coronet_targets)
+        message(STATUS "coronet: using bundled liburingcxx (FetchContent)")
     endif()
 endif()
 

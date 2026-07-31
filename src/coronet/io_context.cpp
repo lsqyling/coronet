@@ -142,6 +142,12 @@ void io_context::run() {
     detail::g_io_context_meta.wait_all_ready();
     log::d("[io_context] run() — barrier passed, entering main loop\n");
 
+    // io_uring: 在事件循环线程延迟初始化 ring，遵守 SINGLE_ISSUER 约束
+    // io_uring: defer ring init to event loop thread (SINGLE_ISSUER compliance)
+#if defined(CORONET_USE_IOURING)
+    proactor_.lazy_init_ring();
+#endif
+
     // 事件循环：依次执行四个阶段
     uint64_t loop_count = 0;
     // P1-1: acquire 确保与 can_stop() 中的 store(seq_cst) 建立 happens-before。
@@ -157,6 +163,11 @@ void io_context::run() {
         }
         // 阶段 0：从跨线程队列搬移协程句柄到 SPSC 环（必须先做，确保新任务能被调度到）
         worker_.drain_cross_thread();
+        // 阶段 0.5：搬移延迟任务队列到 SPSC 环。
+        // epoll 后端的 yield() 使用 defer_task() 将协程加入延迟队列以避免活锁，
+        // 必须在 do_worker_part() 之前排空，否则 yield() 的协程永远不会恢复。
+        // Drain deferred task queue into SPSC ring (epoll yield uses defer_task).
+        worker_.drain_deferred();
         // 阶段 1：从 SPSC 环恢复所有就绪协程
         do_worker_part();
         // 阶段 2：提交批量 I/O 操作（仅 io_uring：submit SQEs；epoll/IOCP：no-op）
@@ -188,14 +199,16 @@ void io_context::run() {
 // 此方法在 deinit() 前执行有限轮次的排空，恢复所有残留协程。
 // 恢复的协程如果发起新 I/O，可能因 proactor 即将关闭而失败（通过异常或错误码处理）。
 void io_context::drain_residual_coroutines() {
-    // 首先排空跨线程队列
+    // 首先排空跨线程队列和延迟队列
     worker_.drain_cross_thread();
+    worker_.drain_deferred();
     worker_.work_once();  // 恢复一个就绪协程（触发级联恢复）
 
     // 有限轮次排空：防止恶意协程无限生成新任务导致无限循环
-    // 每轮 drain_cross_thread + do_worker_part，最多 3 轮
+    // 每轮 drain_cross_thread + drain_deferred + do_worker_part，最多 3 轮
     for (int round = 0; round < 3 && worker_.has_task_ready(); ++round) {
         worker_.drain_cross_thread();
+        worker_.drain_deferred();
         do_worker_part();
     }
 
@@ -227,8 +240,24 @@ void io_context::do_submission_part() noexcept {
 // 阶段 3：收割 I/O 完成事件。对 io_uring 是从 CQ ring 取 CQE，
 // 对 epoll 是从就绪队列取事件后执行 I/O syscall，
 // 对 IOCP 是从完成端口取 OVERLAPPED 结果。
+//
+// io_uring 路径：每次循环收割一个 CQE。仅在 will_stop_ 未设置时
+// 调用 poll_completion（其中 wait_completion 可能阻塞）。
+// 如果 will_stop_ 已设置（由 can_stop() 在同一线程设置），
+// 跳过阻塞等待，避免 TOCTOU 竞态导致的事件循环死锁：
+//   can_stop() 设置 will_stop_ → 但之前的 eventfd CQE 已被消费并 re-arm
+//   → 如果进入 poll_completion 的阻塞路径，没有新的唤醒者 → 死锁。
 void io_context::do_completion_part() noexcept {
+#if defined(CORONET_USE_IOURING)
+    // P1-3: 仅在未停止时等待完成事件。
+    // 如果 will_stop_ 已设置，说明 can_stop() 已在此迭代的 do_worker_part
+    // 中被调用，跳过阻塞以避免等待永远不会到来的 CQE。
+    if (!will_stop_.load(std::memory_order_acquire)) {
+        worker_.poll_completion();
+    }
+#else
     worker_.poll_completion();
+#endif
 }
 
 // ---- 自由函数（方便的全局接口） ----

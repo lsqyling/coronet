@@ -59,7 +59,6 @@ set(coronet_stress_tests
     combinator_stress
     lazy_io_comprehensive
     async_io_iso_stress
-    cp_tool
 )
 foreach(test_target ${coronet_stress_tests})
     add_executable(${test_target} ${test_target}.cpp)
@@ -68,10 +67,51 @@ foreach(test_target ${coronet_stress_tests})
     set_tests_properties(${test_target} PROPERTIES TIMEOUT 120)
 endforeach()
 
+# ============================================================
+# cp_tool — async file copy stress test (parameterized)
+# ============================================================
+# 通过 cmake -D 传入参数，无需修改代码中的硬编码路径:
+#   cmake -S . -B build \
+#       -DCP_TOOL_SRC=/path/to/source.iso \
+#       -DCP_TOOL_DST=/path/to/dest.iso \
+#       -DCP_TOOL_CHUNK_MB=8
+#   ctest --test-dir build -R cp_tool -V
+#
+# 不传参数时使用 cp_tool 内置默认值（源码 DEFAULT_SRC / get_default_desktop）
+set(CP_TOOL_SRC "/home/shiqing/workspace/Downloads/windows_10_professional_x64_2026.iso" CACHE STRING "cp_tool: source file path")
+set(CP_TOOL_DST "/mnt/c/Users/10580/AppData/windows_10_professional_x64_2026.iso" CACHE STRING "cp_tool: destination file path")
+set(CP_TOOL_CHUNK_MB "4" CACHE STRING "cp_tool: chunk size in MB (default: 4)")
+set(CP_TOOL_NO_VERIFY OFF CACHE BOOL "cp_tool: skip verification after copy")
+set(CP_TOOL_TIMEOUT_SEC "600" CACHE STRING "cp_tool: timeout in seconds (default: 600)")
+
+add_executable(cp_tool cp_tool.cpp)
+target_link_libraries(cp_tool PRIVATE coronet::coronet)
+
 # cp_tool: needs shell32 (SHGetFolderPath) and psapi (GetProcessMemoryInfo) on Windows
 if(WIN32)
     target_link_libraries(cp_tool PRIVATE shell32 psapi)
 endif()
+
+# Build cp_tool command with optional arguments
+set(cp_tool_args "")
+
+# Positional args: src dst
+if(CP_TOOL_SRC)
+    list(APPEND cp_tool_args "${CP_TOOL_SRC}")
+endif()
+if(CP_TOOL_DST)
+    list(APPEND cp_tool_args "${CP_TOOL_DST}")
+endif()
+
+# Named options
+list(APPEND cp_tool_args "--chunk" "${CP_TOOL_CHUNK_MB}")
+if(CP_TOOL_NO_VERIFY)
+    list(APPEND cp_tool_args "--no-verify")
+endif()
+list(APPEND cp_tool_args "--timeout" "${CP_TOOL_TIMEOUT_SEC}")
+
+coronet_add_test(cp_tool COMMAND $<TARGET_FILE:cp_tool> ${cp_tool_args})
+
 # cp_tool tests copy a 5GB ISO — needs extended timeout
 set_tests_properties(cp_tool PROPERTIES TIMEOUT 1200)
 

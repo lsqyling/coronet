@@ -43,11 +43,16 @@ struct pem_cert_key {
 
 static pem_cert_key generate_self_signed_cert() {
     // 1. 生成 RSA 2048 密钥对
+    // RSA_new/RSA_generate_key_ex 在 OpenSSL 3.0 中已废弃，
+    // 但 EVP_PKEY 高层 API 的行为在旧版本间不兼容，此处保留兼容性。
     EVP_PKEY* pkey = EVP_PKEY_new();
     BIGNUM* bn = BN_new();
     BN_set_word(bn, RSA_F4);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     RSA* rsa = RSA_new();
     RSA_generate_key_ex(rsa, 2048, bn, nullptr);
+#pragma GCC diagnostic pop
     EVP_PKEY_assign_RSA(pkey, rsa);
     BN_free(bn);
 
