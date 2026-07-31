@@ -32,7 +32,7 @@ task<> client(std::string_view hostname, uint16_t port) {
         if (res < 0) {
             printf("res=%d: %s\n", res, strerror(-res));
         }
-        int fd = static_cast<int>(sock.native_handle());
+        [[maybe_unused]] int fd = static_cast<int>(sock.native_handle());
         co_spawn(session(std::move(sock)));  // transfer ownership to session
     } else {
         printf("Unable to resolve %s\n", hostname.data());

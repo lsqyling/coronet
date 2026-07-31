@@ -118,6 +118,30 @@ struct worker_meta {
     bool has_task_ready() const noexcept {
         return !reap_cur.empty();
     }
+
+    // ---- 延迟任务队列（同线程，无锁）----
+    // Deferred task queue for coroutines that should resume in the next
+    // event loop iteration (e.g. yield). Same-thread access only, no lock needed.
+    // P2-5: Prevents yield() from livelocking do_worker_part()'s while loop.
+    // 延迟任务队列：需要在下一轮事件循环中恢复的协程（如 yield）。
+    // 仅从事件循环线程访问，无需锁。
+    // P2-5: 防止 yield() 在 do_worker_part() 的 while 循环中造成活锁。
+    std::vector<std::coroutine_handle<>> deferred_tasks;
+
+    /// 将协程句柄加入延迟队列（下一轮事件循环才恢复）
+    /// Defer a coroutine handle to the next event loop iteration.
+    void defer_task(std::coroutine_handle<> handle) noexcept {
+        deferred_tasks.push_back(handle);
+    }
+
+    /// 将延迟队列中的句柄搬移到 SPSC 环。事件循环每轮调用。
+    /// Drain deferred queue into the SPSC ring. Called from the event loop.
+    void drain_deferred() noexcept {
+        for (auto h : deferred_tasks) {
+            forward_task(h);
+        }
+        deferred_tasks.clear();
+    }
 };
 
 } // namespace coronet::detail

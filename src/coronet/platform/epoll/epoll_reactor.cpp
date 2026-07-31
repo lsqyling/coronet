@@ -175,10 +175,11 @@ int epoll_proactor::submit(bool wait) noexcept {
     return 0;
 }
 
-int epoll_proactor::wait_completion(completion_info* info) noexcept {
+int epoll_proactor::wait_completion(completion_info* info, bool nonblocking) noexcept {
     // 内部队列为空 → 阻塞等待新事件 / If no ready events, block until one arrives
+    // nonblocking: use timeout=0 to avoid blocking
     if (ready_pos_ >= ready_count_) {
-        if (!fill_ready_queue(true)) {
+        if (!fill_ready_queue(!nonblocking)) {
             return 0;
         }
     }

@@ -39,7 +39,7 @@ task<> mpmc_producer(int id) {
     }
 }
 
-task<> mpmc_consumer(int id) {
+task<> mpmc_consumer(int /*id*/) {
     while (mpmc_consumed.load(std::memory_order_relaxed) < MPMC_TOTAL) {
         int val = co_await mpmc_chan.acquire();
         (void)val;
@@ -130,11 +130,11 @@ task<> block_producer() {
 }
 
 task<> block_consumer() {
-    int v1 = co_await block_chan.acquire();
+    [[maybe_unused]] int v1 = co_await block_chan.acquire();
     assert(v1 == 1);
-    int v2 = co_await block_chan.acquire();
+    [[maybe_unused]] int v2 = co_await block_chan.acquire();
     assert(v2 == 2);
-    int v3 = co_await block_chan.acquire();
+    [[maybe_unused]] int v3 = co_await block_chan.acquire();
     assert(v3 == 3);
     block_consumer_got.store(true);
 }
@@ -161,7 +161,7 @@ task<> drop_test(io_context& ctx) {
     co_await drop_chan.drop();
     assert(drop_chan.size() == 2);
 
-    int val = co_await drop_chan.acquire();
+    [[maybe_unused]] int val = co_await drop_chan.acquire();
     assert(val == 2);
     printf("[DropTest] PASSED\n");
     ctx.can_stop();

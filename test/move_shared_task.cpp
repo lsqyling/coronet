@@ -112,9 +112,9 @@ task<> run() {
     // 整数这种平凡可复制的类型不受移动语义影响
     // 多次 co_await 都返回正确的整数值 42
     auto t_int = make_shared_int();
-    int v1 = co_await t_int;
+    [[maybe_unused]] int v1 = co_await t_int;
     assert(v1 == 42);
-    int v2 = co_await t_int;
+    [[maybe_unused]] int v2 = co_await t_int;
     assert(v2 == 42);
     std::printf("  PASS\n");
 

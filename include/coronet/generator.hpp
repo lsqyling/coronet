@@ -718,7 +718,7 @@ class _Gen_iter {
  *   generator<int> range(int n) {
  *       for (int i = 0; i < n; ++i) co_yield i;
  *   }
- *   for (int x : range(5)) { /* 0, 1, 2, 3, 4 * / }
+ *   for (int x : range(5)) { // 0, 1, 2, 3, 4 }
  *
  * promise_type 的继承链：
  *   promise_type : _Promise_allocator<_Alloc>, _Gen_promise_base<_Yielded>

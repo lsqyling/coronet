@@ -91,7 +91,10 @@ TEST(SocketTest, MoveAssignmentClosesOldFd) {
 TEST(SocketTest, SelfMoveSafe) {
     coronet::tcp_socket s = coronet::tcp_socket::create_tcp(AF_INET);
     // Self-move should not corrupt state (self-assignment check in operator=)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wself-move"
     s = std::move(s);
+#pragma GCC diagnostic pop
     EXPECT_NE(s.native_handle(), coronet::platform::invalid_socket);
 }
 

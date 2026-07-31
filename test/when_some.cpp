@@ -81,7 +81,7 @@ task<> run_and_stop(io_context& ctx) {
     // 应有 2 个结果（f1 立即完成 + f0 1s 后完成）/ Should have 2 results
     assert(results.size() == 2);
     for (const auto &[idx, var] : results) {
-        printf("get the result of f%zu: ", idx);
+        printf("get the result of f%zu: ", (size_t)idx);
         std::visit(
             overload{
                 [](std::monostate) { printf("(void)\n"); },

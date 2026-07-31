@@ -193,11 +193,12 @@ int iocp_proactor::submit(bool /*wait*/) noexcept {
     return 0;
 }
 
-int iocp_proactor::wait_completion(completion_info* info) noexcept {
+int iocp_proactor::wait_completion(completion_info* info, bool nonblocking) noexcept {
     // wait_completion 的核心实现：调用 GetQueuedCompletionStatus 阻塞等待完成事件。
     //
     // 流程：
     //   1. GQCS 阻塞直到有完成事件到达（INFINITE 超时）
+    //      nonblocking=true 时使用 timeout=0 不阻塞
     //   2. 如果返回的 overlapped 为 nullptr，说明是 wakeup 信号（key=1），返回 0
     //   3. 从 overlapped 转换回 iocp_operation，提取结果
     //   4. 填充 completion_info 并返回 1
@@ -207,8 +208,9 @@ int iocp_proactor::wait_completion(completion_info* info) noexcept {
     DWORD bytes = 0;
     ULONG_PTR key = 0;
     OVERLAPPED* overlapped = nullptr;
+    DWORD timeout = nonblocking ? 0 : INFINITE;
     BOOL ok = GetQueuedCompletionStatus(
-        iocp_handle_, &bytes, &key, &overlapped, INFINITE);
+        iocp_handle_, &bytes, &key, &overlapped, timeout);
     if (!overlapped) {
         // key=1 表示 wakeup/退出信号，没有实际 I/O 完成
         if (key == 1) return 0;

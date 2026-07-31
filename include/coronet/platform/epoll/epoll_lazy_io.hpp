@@ -651,6 +651,24 @@ struct epoll_nop final : epoll_awaiter_base<epoll_nop> {
 struct epoll_yield final : epoll_awaiter_base<epoll_yield> {
     epoll_yield() noexcept : epoll_awaiter_base(-1) {}
     int32_t perform_sync_op() noexcept { return 0; }
+
+    // P2-5: name-hiding override — use defer_task instead of forward_task.
+    // The base class await_suspend (sync path) calls forward_task(), which
+    // immediately puts the coroutine back on the SPSC ring. do_worker_part()'s
+    // while loop picks it up again before reaching do_completion_part() →
+    // livelock.  defer_task() defers resumption to the next event loop
+    // iteration, after I/O completions have been processed.
+    //
+    // P2-5: name-hiding 覆盖 — 使用 defer_task 替代 forward_task。
+    // 基类的 await_suspend（同步路径）调用 forward_task() 立即将协程放回 SPSC 环，
+    // do_worker_part() 的 while 循环在到达 do_completion_part() 前再次取回它 → 活锁。
+    // defer_task() 将恢复推迟到下一轮事件循环，在 I/O 完成处理之后。
+    void await_suspend(std::coroutine_handle<> current) noexcept {
+        io_info_.handle = current;
+        io_info_.result = 0;
+        this_thread.worker->defer_task(current);
+        io_info_.handle = nullptr;
+    }
 };
 
 // ============================================================

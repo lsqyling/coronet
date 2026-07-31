@@ -1,10 +1,5 @@
 #pragma once
 
-#ifdef __GNUC__
-#pragma GCC push_macro("linux")
-#undef linux
-#endif
-
 #include "coronet/config/uring.hpp"
 #include "coronet/platform/platform.hpp"
 
@@ -107,6 +102,15 @@ public:
     void init(uint32_t entries);
     void deinit() noexcept;
 
+    /// 延迟初始化 io_uring 实例（必须在事件循环线程调用以遵守 SINGLE_ISSUER 约束）
+    /// Deferred ring init — must be called from the event loop thread to comply
+    /// with IORING_SETUP_SINGLE_ISSUER (kernel >= 6.0).
+    void lazy_init_ring();
+
+    /// 检查 CQ 中是否有待处理的完成事件（非阻塞）
+    /// Check if there are pending completions in the CQ (non-blocking).
+    [[nodiscard]] bool has_completion() noexcept;
+
     std::unique_ptr<io_uring_operation> acquire_operation();
 
     int  submit(bool wait = false) noexcept;
@@ -133,6 +137,7 @@ private:
     io_uring_ring ring_;
     uint32_t entries_ = 0;
     bool initialized_ = false;
+    bool ring_initialized_ = false;  // ring_.init() 是否已在事件循环线程调用
     int event_fd_ = -1;           // eventfd for cross-thread wakeup
     // eventfd 文件描述符，用于跨线程唤醒
     uint64_t eventfd_user_data_ = 0;  // marker for eventfd CQEs
@@ -142,7 +147,3 @@ private:
 };
 
 } // namespace coronet::platform::io_uring
-
-#ifdef __GNUC__
-#pragma GCC pop_macro("linux")
-#endif

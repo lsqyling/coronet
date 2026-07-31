@@ -34,13 +34,28 @@ while [ "$REPO_ROOT" != "/" ] && [ ! -d "$REPO_ROOT/redistools" ]; do
 done
 
 REDIS_DIR="${REPO_ROOT}/redistools"
-REDIS_BENCH="${REDIS_DIR}/redis-benchmark"
-REDIS_CLI="${REDIS_DIR}/redis-cli"
 
-# Check redis tools
-if [ ! -f "$REDIS_BENCH" ]; then
-    echo "ERROR: redis-benchmark not found at $REDIS_BENCH"
-    echo "  Searched upward from: $BUILD_DIR"
+# ---- redis-benchmark: prefer redistools, fallback to system PATH ----
+REDIS_BENCH=""
+if [ -f "${REDIS_DIR}/redis-benchmark" ]; then
+    chmod +x "${REDIS_DIR}/redis-benchmark" 2>/dev/null || true
+    REDIS_BENCH="${REDIS_DIR}/redis-benchmark"
+elif command -v redis-benchmark >/dev/null 2>&1; then
+    REDIS_BENCH="$(command -v redis-benchmark)"
+else
+    echo "ERROR: redis-benchmark not found (tried redistools/ and system PATH)"
+    exit 1
+fi
+
+# ---- redis-cli: prefer redistools, fallback to system PATH ----
+REDIS_CLI=""
+if [ -f "${REDIS_DIR}/redis-cli" ]; then
+    chmod +x "${REDIS_DIR}/redis-cli" 2>/dev/null || true
+    REDIS_CLI="${REDIS_DIR}/redis-cli"
+elif command -v redis-cli >/dev/null 2>&1; then
+    REDIS_CLI="$(command -v redis-cli)"
+else
+    echo "ERROR: redis-cli not found (tried redistools/ and system PATH)"
     exit 1
 fi
 
@@ -129,7 +144,7 @@ test_server() {
     # Parse RPS
     local rps=0
     if echo "$output" | grep -q "requests per second"; then
-        rps=$(echo "$output" | grep -oP '[\d.]+(?= requests per second)')
+        rps=$(echo "$output" | grep -oP '[\d.]+(?= requests per second)' | head -1)
     fi
 
     # Sample CPU/memory
@@ -153,14 +168,14 @@ test_server() {
     kill $pid 2>/dev/null
     wait $pid 2>/dev/null || true
 
-    if [ "$(echo "$rps > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+    if [ -n "$rps" ] && awk "BEGIN { exit !($rps > 0) }" 2>/dev/null; then
         printf "${GREEN}PASS${NC}  rps=%s  cpu=%s%%  mem=%sMB  time=%ss\n" \
             "$(printf "%.0f" "$rps")" "$cpu" "$mem" "$elapsed" | tee -a "$REPORT"
     else
         printf "${RED}FAIL${NC} (elapsed=%ss)\n" "$elapsed" | tee -a "$REPORT"
     fi
 
-    echo "$name,$port,$(printf "%.0f" "$rps"),$cpu,$mem,$([ "$(echo "$rps > 0" | bc -l 2>/dev/null || echo 0)" = "1" ] && echo "PASS" || echo "FAIL"),$elapsed" >> "$CSV"
+    echo "$name,$port,$(printf "%.0f" "$rps"),$cpu,$mem,$([ -n "$rps" ] && awk "BEGIN { exit !($rps > 0) }" 2>/dev/null && echo "PASS" || echo "FAIL"),$elapsed" >> "$CSV"
 }
 
 # ============================================================

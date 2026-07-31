@@ -73,7 +73,7 @@ task<> throw_void_exception(const char* msg) {
 }
 
 task<> test_void_exception() {
-    bool caught = false;
+    [[maybe_unused]] bool caught = false;
     {
         task<> t = throw_void_exception("void exception test");
         try {
@@ -90,7 +90,7 @@ task<> test_void_exception() {
 // 连续两个 task<void> 异常（验证帧销毁后不影响后续操作）
 task<> test_consecutive_void_exceptions() {
     for (int i = 0; i < 5; ++i) {
-        bool caught = false;
+        [[maybe_unused]] bool caught = false;
         task<> t = throw_void_exception(("iter " + std::to_string(i)).c_str());
         try {
             co_await t;
@@ -158,7 +158,7 @@ task<> test_channel_rendezvous_non_default() {
 
     co_await async::timeout(std::chrono::milliseconds(50));
 
-    auto item = co_await chan.acquire();
+    [[maybe_unused]] auto item = co_await chan.acquire();
     assert(item.value == 99);
 }
 
