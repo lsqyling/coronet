@@ -120,13 +120,35 @@ static bool ensure_executable(const std::filesystem::path& p) {
     return true;
 }
 
+/// 向上搜索 redistools 目录（兼容 build/、build-xxx/ 及源码根布局）。
+/// 与 script/win/bench_c1000k.ps1 的向上搜索策略一致。
+/// 旧实现用 get_exe_dir()/".."/".." 固定两层，仅对 <repo>/build 布局有效；
+/// buildmsvc/、build-verify/ 等一层目录名无法命中仓库根的 redistools/。
+/// Search upward for the redistools dir (handles build/, build-xxx/ and
+/// source-root layouts — same strategy as bench_c1000k.ps1).
+static std::filesystem::path find_redistools_dir() {
+    auto dir = get_exe_dir();
+    for (int i = 0; i < 10; ++i) {
+        std::error_code ec;
+        auto cand = dir / "redistools";
+        if (std::filesystem::is_directory(cand, ec) && !ec) return cand;
+        auto parent = dir.parent_path();
+        if (parent == dir || parent.empty()) break;  // 已到文件系统根
+        dir = parent;
+    }
+    return {};
+}
+
 static bool has_redis_benchmark() {
-    // 1) 优先查找项目自带 redis tools (coronet/redistools/)
-    auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-benchmark";
+    // 1) 优先查找项目自带 redis tools (redistools/，向上搜索)
+    auto rt = find_redistools_dir();
+    if (!rt.empty()) {
+        auto redistools = rt / "redis-benchmark";
 #ifdef _WIN32
-    redistools += ".exe";
+        redistools += ".exe";
 #endif
-    if (ensure_executable(redistools)) return true;
+        if (ensure_executable(redistools)) return true;
+    }
 
     // 2) 查找同目录
     auto local = get_exe_dir() / "redis-benchmark";
@@ -147,12 +169,15 @@ static bool has_redis_benchmark() {
 }
 
 static std::string find_redis_benchmark() {
-    // 返回 redis-benchmark 的完整路径
-    auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-benchmark";
+    // 返回 redis-benchmark 的完整路径（redistools/ 向上搜索）
+    auto rt = find_redistools_dir();
+    if (!rt.empty()) {
+        auto redistools = rt / "redis-benchmark";
 #ifdef _WIN32
-    redistools += ".exe";
+        redistools += ".exe";
 #endif
-    if (ensure_executable(redistools)) return redistools.string();
+        if (ensure_executable(redistools)) return redistools.string();
+    }
 
     auto local = get_exe_dir() / "redis-benchmark";
 #ifdef _WIN32
@@ -164,11 +189,15 @@ static std::string find_redis_benchmark() {
 }
 
 static std::string find_redis_cli() {
-    auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-cli";
+    // redis-cli 完整路径（redistools/ 向上搜索）
+    auto rt = find_redistools_dir();
+    if (!rt.empty()) {
+        auto redistools = rt / "redis-cli";
 #ifdef _WIN32
-    redistools += ".exe";
+        redistools += ".exe";
 #endif
-    if (ensure_executable(redistools)) return redistools.string();
+        if (ensure_executable(redistools)) return redistools.string();
+    }
 
     auto local = get_exe_dir() / "redis-cli";
 #ifdef _WIN32

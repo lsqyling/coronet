@@ -29,9 +29,31 @@
 #include <chrono>
 
 // ---- 测试参数 ----
-constexpr uint16_t TestPort = 9443;
+constexpr uint16_t DefaultPort = 9443;
 constexpr const char* TestMsg = "Hello, coronet TLS echo!";
 constexpr int BufSize = 4096;
+
+// ============================================================
+// 动态选端口（Windows 兼容）
+// ============================================================
+// WSL2/Hyper-V 会在启动时动态保留若干 TCP 端口段（excluded port range），
+// 绑定到保留段内的端口会返回 WSAEACCES（与端口是否被占用无关）。
+// 探测候选端口，取第一个可绑定的端口，避免固定端口命中保留段。
+// Linux 上第一个候选端口通常直接成功，行为不变。
+//
+// 注意：必须在 io_context 构造之后调用 —— Windows 上 WSAStartup
+// 在 io_context 构造函数中执行。
+static uint16_t pick_usable_port(uint16_t start) {
+    for (uint16_t p = start; p < start + 64; ++p) {
+        try {
+            coronet::tcp_socket s = coronet::tcp_socket::create_tcp(AF_INET);
+            s.set_reuse_addr(true);
+            s.bind(coronet::inet_address{p});  // 与服务器相同的绑定方式
+            return p;                          // bind 成功 → 端口可用
+        } catch (...) { /* WSAEACCES / EADDRINUSE → 试下一个 */ }
+    }
+    return start;  // 兜底，保持原行为
+}
 
 // ============================================================
 // 运行时生成自签名证书（仅用于测试，勿用于生产）
@@ -104,7 +126,10 @@ static pem_cert_key generate_self_signed_cert() {
 // ============================================================
 // TLS Echo 服务器会话
 // ============================================================
-coronet::task<> tls_echo_session(coronet::tls_socket conn) {
+// 注意：conn 用引用传递而非按值 —— tls_socket 含 16KB raw_buf_，
+// MSVC 2022 (14.41) 对协程按值传 ~16KB 大对象时的参数复制代码生成有 bug
+// （目标地址被 32 位截断 → 访问冲突）。调用方保证 conn 存活期间会话完成。
+coronet::task<> tls_echo_session(coronet::tls_socket& conn) {
     char buf[BufSize];
     while (true) {
         int nr = co_await conn.recv(buf);
@@ -118,14 +143,14 @@ coronet::task<> tls_echo_session(coronet::tls_socket conn) {
 // TLS Echo 服务器（接受一个连接后退出）
 // ============================================================
 coronet::task<> tls_echo_server(
-    coronet::tls_context& ctx, bool& server_ready) {
-    coronet::tls_acceptor ac{coronet::inet_address{TestPort}, ctx};
-    std::printf("[server] TLS listening on port %d\n", TestPort);
+    coronet::tls_context& ctx, uint16_t port, bool& server_ready) {
+    coronet::tls_acceptor ac{coronet::inet_address{port}, ctx};
+    std::printf("[server] TLS listening on port %d\n", port);
     server_ready = true;
 
     auto conn = co_await ac.accept_socket();
     std::printf("[server] TLS connection accepted\n");
-    co_await tls_echo_session(std::move(conn));
+    co_await tls_echo_session(conn);
     std::printf("[server] TLS session ended\n");
 }
 
@@ -133,16 +158,17 @@ coronet::task<> tls_echo_server(
 // TLS Echo 客户端
 // ============================================================
 coronet::task<> tls_echo_client(
-    coronet::tls_context& ctx, bool& success, coronet::io_context& client_ctx) {
+    coronet::tls_context& ctx, uint16_t port, bool& success,
+    coronet::io_context& client_ctx) {
     coronet::inet_address addr;
-    if (!coronet::inet_address::resolve("127.0.0.1", TestPort, addr)) {
+    if (!coronet::inet_address::resolve("127.0.0.1", port, addr)) {
         std::fprintf(stderr, "[client] resolve failed\n");
         success = false;
         client_ctx.can_stop();
         co_return;
     }
 
-    std::printf("[client] connecting to 127.0.0.1:%d (TLS)\n", TestPort);
+    std::printf("[client] connecting to 127.0.0.1:%d (TLS)\n", port);
     auto sock = co_await coronet::tls_socket::connect(addr, ctx);
     std::printf("[client] TLS connected, handshake done\n");
 
@@ -176,6 +202,7 @@ coronet::task<> tls_echo_client(
 // main
 // ============================================================
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);  // 诊断: 立即刷新 (调试后保留, 与其它测试一致)
     std::printf("=== coronet TLS Echo Integration Test ===\n");
 
     // 初始化 OpenSSL
@@ -205,7 +232,10 @@ int main() {
 
     // 启动服务器
     coronet::io_context server_io;
-    server_io.co_spawn(tls_echo_server(server_ctx, server_ready));
+    // 动态选端口：避免 WSL2/Hyper-V 排除端口范围导致 bind 失败 (WSAEACCES)
+    const uint16_t test_port = pick_usable_port(DefaultPort);
+    std::printf("[setup] using test port %u\n", test_port);
+    server_io.co_spawn(tls_echo_server(server_ctx, test_port, server_ready));
     server_io.start();
 
     // 等待服务器就绪
@@ -221,7 +251,7 @@ int main() {
 
     // 运行客户端
     coronet::io_context client_io;
-    client_io.co_spawn(tls_echo_client(client_ctx, success, client_io));
+    client_io.co_spawn(tls_echo_client(client_ctx, test_port, success, client_io));
     client_io.start();
     client_io.join();
 

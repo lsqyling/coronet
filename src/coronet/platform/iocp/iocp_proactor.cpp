@@ -2,6 +2,7 @@
 #include "coronet/log/log.hpp"
 
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
@@ -133,11 +134,21 @@ void iocp_proactor::deinit() noexcept {
     //   - 如果 outstanding_work_ > 0，说明有后台线程仍在执行阻塞操作
     //     （win_timeout/win_read/win_write），等待它们完成并投递结果
     //   - 使用短超时（1ms）等待，避免无限阻塞但给后台线程足够时间
-    //   - 最多等待 1000 轮（总计最多 1 秒），防止永久阻塞
+    //   - 最多等待 1 秒（墙钟时间），防止永久阻塞
+    //
+    // P2-x fix: 排空预算改为按墙钟时间限制，而非轮次 × GQCS(1ms)。
+    // GetQueuedCompletionStatus 的 1ms 超时实际耗时受系统定时器粒度影响
+    // （默认 ~10-15.6ms/轮），原 1000 轮上限实际耗时可达 ~10s，
+    // 远超"最多 1 秒"的设计意图 —— combinator_stress 每阶段 io_context
+    // 析构耗时 ~10s 的根因。超时预算未用完的轮次会正常收割后续完成事件，
+    // 未在预算内完成的超时操作会在 IOCP 关闭后投递失败并被安全回收。
+    const auto drain_deadline = std::chrono::steady_clock::now()
+                              + std::chrono::seconds(1);
     int drain_rounds = 0;
-    constexpr int max_drain_rounds = 1000;
+    constexpr int max_drain_rounds = 1000;  // 兜底上限，正常情况下不会触达
     while (outstanding_work_.load(std::memory_order_acquire) > 0 &&
-           drain_rounds < max_drain_rounds) {
+           drain_rounds < max_drain_rounds &&
+           std::chrono::steady_clock::now() < drain_deadline) {
         DWORD bytes = 0;
         ULONG_PTR key = 0;
         OVERLAPPED* ov = nullptr;

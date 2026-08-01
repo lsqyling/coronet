@@ -48,7 +48,7 @@
   #define CORO_O_TRUNC  _O_TRUNC
   #define CORO_O_WRONLY (_O_WRONLY | _O_BINARY)
 
-  static const char* ISO_PATH = "D:/dev/workspace/yidaoyun/coronet-win/data/windows_10_professional_x64_2026.iso";
+  static const char* ISO_PATH = "D:/dev/Downloads/windows_10_professional_x64_2026.iso";
 #else
   #include <fcntl.h>
   #include <sys/stat.h>

@@ -16,6 +16,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <queue>
 #include <span>
 #include <thread>
 #include <vector>
@@ -23,6 +24,7 @@
 #include <mswsock.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <timeapi.h>   // timeBeginPeriod (winmm.lib)
 #include <io.h>        // _read, _write
 
 namespace coronet::detail {
@@ -547,17 +549,163 @@ private:
     bool stop_ = false;
 };
 
-/// Windows timeout: delegates blocking wait to the shared thread pool
-/// that posts IOCP completion after the delay. The operation is kept
-/// alive by the pool worker via raw pointer ownership transfer.
-// Windows 超时：将阻塞等待委托给共享线程池，延迟后通过 IOCP 投递完成事件。
-// 操作对象的所有权通过裸指针转移给线程池 worker 以保证其生命周期。
+// ============================================================
+// win_timer_thread — dedicated timer thread with deadline min-heap
+// ============================================================
+// Windows 没有 Linux timerfd / io_uring timeout 那样的内核定时器，
+// 只能借助线程等待模拟超时。
 //
-// 为什么需要后台线程？
+// 旧方案（bug #1）：把 Sleep(ms) 丢给共享线程池 win_file_io_pool。
+//   当并发 Sleep 数超过池线程数（max(4, hardware_concurrency())）时，
+//   后提交的短超时会被长超时堵在 FIFO 队列里（队头阻塞），
+//   完成顺序不再等于截止时间顺序 —— combinator_stress Phase 5 失败根因
+//   （150ms 超时排队等到 100ms 完成后才启动，反而晚于 200ms 超时）。
+//
+// 旧方案（bug #2）：条件变量 condition_variable::wait_until + notify_one。
+//   在 MSVC 14.41 上实测（mini_cv 独立复现）：worker 阻塞在
+//   wait_until(长截止时间) 时，notify_one 无法将其唤醒，短超时会一直
+//   等到旧的长截止时间才批量触发（combinator_stress 每阶段 10s 的根因）。
+//
+// 当前方案：单一专用定时器线程 + 最小堆 + Win32 waitable timer + pulse 事件。
+//   - submit(): 加锁把 (deadline, seq, op, iocp) 推入最小堆，
+//     将 waitable timer 重新武装到最早的 deadline，SetEvent(pulse) 唤醒 worker
+//   - worker 循环：弹出所有已到期条目（堆序弹出 → 完成顺序 == 截止顺序），
+//     逐个 op->on_sync_completion(iocp, 0) 投递到 IOCP；
+//     无到期条目时 WaitForMultipleObjects(timer, pulse) 阻塞
+//   - timer 负责"无人提交时按时到期"，pulse 负责"新提交/更早 deadline 立即醒来"，
+//     两者互不依赖，语义确定
+//   - 完成顺序 == 截止时间顺序（与调度抖动无关），
+//     与 Linux 内核定时器（timerfd / IORING_OP_TIMEOUT）语义一致
+//   - 1 个线程服务任意数量的超时，无队头阻塞
+//
+// 精度（bug #3）：Windows 系统定时器分辨率默认 15.625ms（64 tick/s），
+//   SetWaitableTimer 的到期时间被量化到下一个系统 tick，触发误差 0~15.6ms
+//   （timer_accuracy 实测 late 2.6~14.5ms，Linux timerfd 为亚毫秒）。
+//   构造时调用 timeBeginPeriod(1) 将 tick 提升到 1ms，触发误差降至 ~1ms。
+//   副效果：deinit drain 中 GQCS(1ms) 每轮实际耗时从 ~10-15.6ms 变为 ~1ms。
+//
+// Leaky singleton：永不析构（与 win_file_io_pool 一致）。定时器线程在
+// 进程退出时由 OS 回收。向已关闭的 IOCP handle 投递完成事件是良定义行为
+// （PostQueuedCompletionStatus 返回 0），操作对象被回收，不泄漏。
+// timeBeginPeriod(1) 仅在构造时调用一次、不配对的 timeEndPeriod ——
+// 进程存活期间保持 1ms 分辨率（node.js / boost.asio 通行做法），
+// 系统计数器在进程退出时自动清零，无需手动恢复。
+class win_timer_thread {
+public:
+    static win_timer_thread& instance() noexcept {
+        static auto* timer = new win_timer_thread();
+        return *timer;
+    }
+
+    /// 提交一个超时：deadline = now + ms，到期后投递完成事件到 iocp。
+    /// op 的所有权转移给定时器线程（裸指针传递，完成后由事件循环回收）。
+    void submit(platform::iocp::iocp_operation* op, HANDLE iocp,
+                long long ms) noexcept {
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::milliseconds(ms);
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            heap_.push(entry{deadline, seq_++, op, iocp});
+            arm_timer_locked();      // 重新武装到最早 deadline
+        }
+        SetEvent(pulse_);            // 确保 worker 立即醒来处理新条目
+    }
+
+    win_timer_thread(const win_timer_thread&) = delete;
+    win_timer_thread& operator=(const win_timer_thread&) = delete;
+
+private:
+    struct entry {
+        std::chrono::steady_clock::time_point deadline;
+        uint64_t seq;                              // 同 deadline 时的提交顺序
+        platform::iocp::iocp_operation* op;
+        HANDLE iocp;
+
+        // 最小堆：std::priority_queue 是最大堆，反转比较得到小顶堆。
+        // 先按 deadline，同 deadline 时先提交的（seq 小）先弹出。
+        bool operator<(const entry& other) const noexcept {
+            if (deadline != other.deadline) return deadline > other.deadline;
+            return seq > other.seq;
+        }
+    };
+
+    // 必须在持有 mtx_ 时调用。把 waitable timer 武装到堆顶 deadline
+    // （相对时间，100ns 单位，负数表示相对当前时刻）。
+    void arm_timer_locked() noexcept {
+        if (heap_.empty()) {
+            CancelWaitableTimer(timer_);
+            return;
+        }
+        auto rel_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            heap_.top().deadline - std::chrono::steady_clock::now()).count();
+        if (rel_us < 0) rel_us = 0;
+        LARGE_INTEGER due;
+        due.QuadPart = -rel_us * 10;   // 相对时间：-N × 100ns
+        SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE);
+    }
+
+    win_timer_thread() noexcept
+        : pulse_(CreateEventW(nullptr, FALSE, FALSE, nullptr)),  // auto-reset
+          timer_(CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS)),
+          thread_([this] { worker(); }) {
+        // bug #3: 提升系统定时器分辨率 15.625ms → 1ms。
+        // SetWaitableTimer 的到期时间被量化到下一个系统 tick，默认 64Hz 下
+        // 触发误差达 0~15.6ms（timer_accuracy 实测 late 2.6~14.5ms）。
+        // timeBeginPeriod(1) 使 tick 变为 1ms，触发误差降至 ~1ms；
+        // 同时使 deinit drain 中 GQCS(1ms) 每轮实际耗时 ~10-15.6ms → ~1ms。
+        // 泄漏式单例 → 进程存活期间保持 1ms，不调 timeEndPeriod
+        // （node.js / boost.asio 通行做法，进程退出时 OS 自动清零计数器）。
+        ::timeBeginPeriod(1);
+    }
+
+    void worker() noexcept {
+        std::vector<entry> expired;
+        HANDLE handles[2] = {timer_, pulse_};
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto now = std::chrono::steady_clock::now();
+                // 弹出所有已到期条目（堆序弹出 → 完成顺序 == 截止顺序）
+                while (!heap_.empty() && heap_.top().deadline <= now) {
+                    expired.push_back(heap_.top());
+                    heap_.pop();
+                }
+                if (!heap_.empty()) arm_timer_locked();  // 重武装到新的最早 deadline
+            }
+            if (expired.empty()) {
+                // 无到期条目 → 等待 timer 到期 或 submit 的 pulse
+                WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            } else {
+                for (auto& e : expired) {
+                    e.op->on_sync_completion(e.iocp, 0);
+                }
+                expired.clear();
+            }
+        }
+    }
+
+    std::mutex mtx_;
+    std::priority_queue<entry> heap_;
+    uint64_t seq_ = 0;             // 仅锁内访问
+    HANDLE pulse_ = nullptr;       // auto-reset 事件：submit 时 SetEvent
+    HANDLE timer_ = nullptr;       // waitable timer：武装到最早 deadline
+    std::thread thread_;
+};
+
+/// Windows timeout: delegates waiting to the dedicated timer thread
+/// that posts IOCP completion after the deadline. The operation is
+/// kept alive by the timer thread via raw pointer ownership transfer.
+// Windows 超时：将等待委托给专用定时器线程，到点后通过 IOCP 投递完成事件。
+// 操作对象的所有权通过裸指针转移给定时器线程以保证其生命周期。
+//
+// 为什么用专用定时器线程？
 //   Windows 没有像 Linux timerfd 或 io_uring timeout 这样的异步定时器机制，
-//   IOCP 本身不直接支持超时。唯一的方案是在线程池中调用 Sleep()，
+//   IOCP 本身不直接支持超时。唯一的方案是在后台线程中等待 Sleep()，
 //   然后通过 on_sync_completion 通知完成。
-//   使用共享线程池替代每操作新建线程，避免高并发下的线程创建开销。
+//   旧实现把 Sleep 丢给共享文件 I/O 线程池，超时数超过池线程数时会发生
+//   队头阻塞导致完成顺序错乱（见 win_timer_thread 注释）。专用定时器线程
+//   用最小堆按截止时间排序，保证完成顺序与截止时间一致，且任意数量的
+//   超时都只需一个线程。
 struct win_timeout final : win_awaiter_base<win_timeout> {
     friend class win_awaiter_base<win_timeout>;
 
@@ -570,7 +718,7 @@ struct win_timeout final : win_awaiter_base<win_timeout> {
 
 private:
     void issue_io() noexcept {
-        auto* raw_op = op_.release();        // transfer ownership to pool worker
+        auto* raw_op = op_.release();        // transfer ownership to timer thread
         // P1-2 fix: 捕获 HANDLE（内核句柄）而非 proactor*（内存指针）。
         // HANDLE 是值语义，io_context 析构后 PostQueuedCompletionStatus
         // 对已关闭 handle 返回 0（良定义行为），彻底消除 use-after-free。
@@ -578,11 +726,7 @@ private:
             static_cast<platform::iocp::iocp_proactor*>(
                 this_thread.worker->proactor)->native_handle());
         DWORD ms = static_cast<DWORD>(dur_ms_);
-        win_file_io_pool::instance().submit(
-            [raw_op, iocp, ms]() noexcept {
-                Sleep(ms);
-                raw_op->on_sync_completion(iocp, 0);
-            });
+        win_timer_thread::instance().submit(raw_op, iocp, ms);
     }
 
     long long dur_ms_ = 0;

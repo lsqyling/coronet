@@ -72,6 +72,13 @@ namespace coronet {
 ///   - SSL 会话和 BIO 由 OpenSSL 管理，SSL_free 时自动释放
 ///   - tls_socket 可移动，移动后源对象为空壳
 ///   - 析构时自动释放 SSL 会话和 TCP 套接字
+///
+/// 已知限制（MSVC 2022 14.41）：
+///   - tls_socket 含 16KB raw_buf_，体积 ~16KB
+///   - 将其**按值**作为协程参数传入会触发 MSVC 参数复制代码生成 bug
+///     （memcpy 目标地址被 32 位截断 → 访问冲突，tls_echo_test 崩溃根因）
+///   - 正确做法：协程参数用引用（tls_socket&）或右值引用 + 移入本地变量
+///   - 返回值路径（task<tls_socket> 的 co_return）不受影响
 class tls_socket {
 public:
     // ---- 构造/析构 ----

@@ -11,12 +11,16 @@
 using namespace coronet;
 
 // TLS echo session — demonstrates using tls_socket with the transport concept
-task<> tls_session(tls_socket conn) {
+// 注意：conn 用右值引用而非按值 —— tls_socket 含 16KB raw_buf_，
+// MSVC 2022 (14.41) 对协程按值传 ~16KB 大对象时的参数复制代码生成有 bug
+// （目标地址被 32 位截断 → 访问冲突）。移入本地变量获取所有权。
+task<> tls_session(tls_socket&& conn) {
+    tls_socket sock = std::move(conn);
     char buf[8192];
     while (true) {
-        int nr = co_await conn.recv(buf);
+        int nr = co_await sock.recv(buf);
         if (nr <= 0) break;
-        co_await conn.send({buf, static_cast<size_t>(nr)});
+        co_await sock.send({buf, static_cast<size_t>(nr)});
     }
 }
 

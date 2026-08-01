@@ -1020,4 +1020,567 @@ epoll + io_uring 双后端全部测试通过:
   sem, channel_stress, net_echo, mutex, combinator_stress,
   channel, cv_notify_all, cv_notify_one, timer,
   when_all, when_any, when_some, timer_accuracy: all PASSED
+
+---
+
+# Bug 修复记录：Windows IOCP 定时器路径（combinator_stress 完成顺序错乱 + 每阶段 10s）
+
+**日期**: 2026-08-01  
+**分支**: build/win（coronetwin worktree）  
+**影响范围**: IOCP 后端（Windows；epoll 和 io_uring 不受影响）
+
+---
+
+## Bug 描述
+
+执行 CTest `stress-test/combinator_stress.cpp`（Windows IOCP 路径）时：
+
+1. **Phase 5 (when_some) 完成顺序断言失败**：
+   ```
+   FAIL D:\dev\workspace\yidaoyun\coronetwin\stress-test\combinator_stress.cpp:153
+   Test #29: combinator_stress ...Exit code 0xc0000409***Exception:  76.46 sec
+   ```
+   `CHK(results[1].first == 4u)` 失败 —— 期望完成顺序 `100ms(idx1) < 150ms(idx4) < 200ms(idx2)`，
+   实际是 `[1, 2, 4]`：**200ms 的 timeout 抢在 150ms 之前完成**。
+   （0xc0000409 是 MSVC 下 `std::abort()` 经 `__fastfail` 的退出码，即 CHK 失败。）
+
+2. **测试总耗时 76.46 秒**：每个阶段都恰好耗时 ~10s。
+
+Linux 平台（epoll timerfd / io_uring IORING_OP_TIMEOUT）同一测试全部通过，问题仅存在于 Windows IOCP 路径。
+
+---
+
+## 为什么会发生这个 Bug？
+
+### Bug A：Sleep + 共享线程池的队头阻塞（完成顺序错乱）
+
+旧 `win_timeout` 把 `Sleep(ms)` 丢给共享线程池 `win_file_io_pool`（`max(4, hardware_concurrency())` 个线程）：
+
+```
+phase_when_some
+└─ co_await some(3, ...)                       when_all.hpp:359
+   └─ co_spawn(any_run_one<...>) × 5
+      └─ co_await async::timeout(ms)           async_io.hpp:122
+         └─ win_timeout{ms}                    iocp_win_io.hpp
+            └─ win_file_io_pool::submit(
+                 [Sleep(ms); op->on_sync_completion(iocp, 0)])
+               └─ [池线程] Sleep(ms) → PQC → GQCS → 恢复协程
+```
+
+Phase 5 有 **6 个并发 Sleep**（5 个子任务 + 1 个 10s stopper），池只有 4 线程（4 核机器）：
+
+```
+t=0    : 300/100/200/500 各占一个线程；150 和 10000(stopper) 在 FIFO 队列等待
+t≈100ms: 100 完成 → 线程空闲 → 弹出 150，此时才启动 → t≈250ms 才到期
+t≈200ms: 200 完成（t=0 就已启动）
+完成顺序: [1(100), 2(200), 4(250), ...]  →  results=[(1),(2),(4)]  →  line 153 失败
+```
+
+**队头阻塞**：池线程数 < 并发 Sleep 数时，后提交的短超时被前面的 Sleep 堵在 FIFO 队列里，完成顺序不再等于截止时间顺序；叠加 Sleep 本身的调度抖动，顺序完全无保证。失败行号佐证：线程数 ≥5 → 通过；恰好 4 线程 → 顺序 `[1,2,4]` → 只失败 line 153；<4 线程 → line 152 先失败。
+
+Linux 上 epoll 用 timerfd、io_uring 用 `IORING_OP_TIMEOUT`，均由内核按截止时间触发，顺序严格保证 —— 这就是 Linux 全过、Windows 挂的根因。
+
+### Bug C：io_context 析构的 deinit 排空循环实际耗时 ~10s
+
+修复 Bug A 后每阶段 still 耗时 10s。用 PowerShell 给输出加时间戳定位到：**每个阶段的 when_all 实际 15-90ms 就完成**，慢的是 `ctx.join()`：
+
+```
+  1177 === Phase 2 ===
+  1206 [ 1030ms] when_all void done     ← 阶段本身 29ms 完成
+  2204 [Phase 2] PASSED                 ← join 耗时 ~1s
+```
+
+`iocp_proactor::deinit()` 的排空循环：
+
+```cpp
+while (outstanding_work_ > 0 && drain_rounds < 1000) {
+    GetQueuedCompletionStatus(iocp, ..., timeout = 1);  // 1ms 超时
+    ...
+}
+```
+
+**根因**：`GQCS` 的 1ms 超时实际耗时受系统定时器粒度影响（默认 ~10-15.6ms/轮），1000 轮上限实际耗时 **~10 秒**，远超"最多 1 秒"的设计意图。每个阶段析构时都有未完成的 10s stopper 定时器（`outstanding_work_ > 0`），排空循环空转到 1000 轮才关闭 IOCP。原测试 76.46s ≈ 6 阶段 × ~10s 排空 + 阶段执行 + Phase 5 中止。
+
+### Bug B（实现过程中发现，已规避）：condition_variable 方案在 MSVC 上失效
+
+修复 Bug A 时先尝试了 `condition_variable::wait_until` + `notify_one` 的定时器线程（最小堆 + CV），实测每阶段仍 10s。写了独立复现程序 `mini_cv`（无任何 coronet 依赖）验证：
+
+```
+[main] submitted id=1 (3000ms) at 0ms
+[main] submitted id=2 (50ms) at 200ms     ← notify_one 已调用
+[worker] firing id=2 ... at 2216ms        ← 50ms 超时 ~2s 后才触发！
+```
+
+**MSVC 14.41 上 `notify_one` 无法唤醒阻塞在远截止时间 `wait_until` 中的线程** —— 短超时会一直等到旧的长截止时间才批量触发。这不是代码 bug，是平台 CV 行为缺陷，最终方案完全绕开 CV。
+
+---
+
+## 怎么解决的？
+
+### 修复 A：win_timer_thread —— waitable timer + 最小堆 + pulse 事件
+
+**文件**: `include/coronet/platform/iocp/iocp_win_io.hpp`
+
+新增专用定时器线程 `win_timer_thread`（leaky singleton，与 `win_file_io_pool` 同模式）：
+
+- **submit()**：加锁把 `(deadline, seq, op, iocp)` 推入最小堆，将 Win32 waitable timer 重新武装到最早 deadline，`SetEvent(pulse)` 唤醒 worker
+- **worker 循环**：弹出所有已到期条目（堆序弹出 → **完成顺序 == 截止时间顺序**，与调度抖动无关），逐个 `op->on_sync_completion(iocp, 0)` 投递到 IOCP；无到期条目时 `WaitForMultipleObjects(timer, pulse)` 阻塞
+- **timer** 负责"无人提交时按时到期"，**pulse**（auto-reset 事件）负责"新提交/更早 deadline 立即醒来"，两者互不依赖，语义确定
+- 1 个线程服务任意数量的超时，无队头阻塞
+
+`win_timeout::issue_io()` 改为：
+
+```cpp
+void issue_io() noexcept {
+    auto* raw_op = op_.release();        // 所有权转移给定时器线程
+    HANDLE iocp = ...native_handle();    // HANDLE 值语义，iocp 析构后 PQC 失败是良定义行为
+    DWORD ms = static_cast<DWORD>(dur_ms_);
+    win_timer_thread::instance().submit(raw_op, iocp, ms);
+}
+```
+
+### 修复 C：deinit 排空预算改为墙钟时间
+
+**文件**: `src/coronet/platform/iocp/iocp_proactor.cpp`
+
+`GQCS(1ms)` 每轮实际耗时 ~10ms（定时器粒度），原"1000 轮 ≈ 1 秒"的假设不成立。改为 steady_clock 1 秒墙钟预算（保留 1000 轮兜底）：
+
+```cpp
+const auto drain_deadline = std::chrono::steady_clock::now()
+                          + std::chrono::seconds(1);
+while (outstanding_work_.load(std::memory_order_acquire) > 0 &&
+       drain_rounds < max_drain_rounds &&
+       std::chrono::steady_clock::now() < drain_deadline) {
+```
+
+未在预算内完成的超时操作在 IOCP 关闭后投递失败并被 `recycle_operation` 安全回收，无泄漏。
+
+---
+
+## 为什么这么解决？
+
+### 替代方案及驳回理由
+
+1. **condition_variable::wait_until + notify**：MSVC 14.41 实测 notify 无法唤醒远截止时间等待（mini_cv 独立复现），驳回。
+2. **增大线程池**：不治本（Sleep 抖动 + 并发数未知，顺序仍无保证）。
+3. **CreateTimerQueueTimer**：系统定时器队列默认线程池很小，长回调会阻塞其他定时器，多个定时器并发回调时顺序无法保证。
+4. **放宽测试断言（不校验顺序）**：削弱覆盖，且 Linux 语义本来就保证顺序，应让 IOCP 对齐而非放松测试。
+
+### 当前方案的优势
+
+1. **顺序确定性**：最小堆按 deadline 弹出 + 单线程串行投递，完成顺序 == 截止时间顺序，与 Linux 内核定时器语义一致
+2. **无队头阻塞**：任意数量超时只需 1 个线程
+3. **平台语义可靠**：waitable timer + event 是 Win32 原生同步原语，不依赖 CV 的实现细节
+4. **最小侵入**：只改 `win_timeout` 和 deinit 排空预算；`win_file_io_pool` 保留（仍服务文件 read/write）；epoll/io_uring 零改动
+
+### 涉及文件汇总
+
+| 文件 | 修改内容 |
+|------|---------|
+| `include/coronet/platform/iocp/iocp_win_io.hpp` | 新增 `win_timer_thread`（waitable timer + pulse + 最小堆）；`win_timeout::issue_io()` 改走定时器线程 |
+| `src/coronet/platform/iocp/iocp_proactor.cpp` | `deinit()` 排空预算由 1000 轮 × GQCS(1ms) 改为 1 秒墙钟时间 |
+
+### 验证结果
+
+```
+修复前（Windows IOCP）:
+  FAIL stress-test/combinator_stress.cpp:153
+  Exit code 0xc0000409***Exception:  76.46 sec
+
+修复后（Windows IOCP）:
+  === ALL COMBINATOR TESTS PASSED ===   6.25s（连续 6 次运行 exit=0）
+  Phase 5 when_some: 启动后 216ms 完成（100/150/200ms 顺序正确）
+  每阶段 io_context join：~1s（deinit 排空预算内）
+
+说明: 输出中 "[iocp] deinit: 1 outstanding operations after drain" 是预期行为
+      —— 10s stopper 定时器超出 1s 排空预算，IOCP 关闭后投递失败被安全回收，无泄漏。
+```
+```
+---
+
+# Bug 修复记录：Windows TLS 路径（tls_echo_test 端口保留段 + MSVC 大对象按值参数崩溃）
+
+**日期**: 2026-08-01  
+**分支**: build/win（coronetwin worktree）  
+**影响范围**: Windows 平台 TLS 测试与示例（与 Linux epoll/io_uring 无关）
+
+---
+
+## Bug 描述
+
+CTest `test/tls_echo_test.cpp`（Windows）失败：
+
+```
+24/34 Test #25: tls_echo_test ....................***Failed    1.94 sec
+[error] server failed to start
+```
+
+修复服务器启动后，又暴露第二个 bug：客户端发送数据后立即**访问冲突崩溃**（0xC0000005，stdout 全缓冲导致输出丢失，需 setvbuf 后定位）。
+
+---
+
+## 为什么会发生这个 Bug？
+
+### Bug A：端口 9443 命中 WSL2/Hyper-V 排除端口段
+
+`tls_acceptor` 构造 → `bind()` 抛 `std::system_error`（**WSAEACCES 10013**，"以一种访问权限不允许的方式做一个访问套接字的尝试"）→ 服务器协程异常终止 → `server_ready` 永为 false。
+
+用探针逐步定位（协程内 try/catch）：`create_tcp` / `set_reuse_addr` 均成功，仅 `bind` 失败。`netsh interface ipv4 show excludedportrange protocol=tcp` 显示：
+
+```
+起始端口  结束端口
+9350     9449    ← 9443 在此动态保留段内
+```
+
+**WSL2/Hyper-V 每次启动会动态保留若干 TCP 端口段**，绑定到保留段内端口直接返回 WSAEACCES（与端口是否被占用无关）。排除段动态变化，固定换端口治标不治本。
+
+### Bug B：MSVC 2022 (14.41) 协程按值传 ~16KB 大对象崩溃
+
+服务器 accept 成功后执行 `co_await tls_echo_session(std::move(conn))` —— `tls_socket` 含 16KB `raw_buf_`，体积 ~16KB，**按值作为协程参数**。cdb 抓崩溃栈 + 反汇编 + 寄存器：
+
+```
+崩溃点: tls_echo_server$_ResumeCoro$1+0x2da  (rep movs — 复制 0x4018=16408 字节)
+rbx = 0x000001ec4d874e10   (服务器协程帧, 高地址)
+rsi = 0x000001ec4d878f38   (源地址, 完整 64 位)
+rdi = 0x000000004d87cf50   (目标地址, 只剩低 32 位!! ← 被零扩展截断)
+```
+
+编译器在协程恢复函数里用 `lea edx,[rbx+8140h]; mov edi,edx` 计算参数复制目标地址 —— **32 位 lea 把堆上的协程帧地址截断成低 32 位**，向 0x4d87cf50 这种低地址写入 → 访问冲突。返回路径（`task<tls_socket>` 的 co_return）正常，仅按值参数路径触发。
+
+---
+
+## 怎么解决的？
+
+### 修复 A：动态选端口（test/tls_echo_test.cpp）
+
+新增 `pick_usable_port()`：在 main 中（io_context 构造之后，WSAStartup 已就绪）同步探测候选端口，`create_tcp + set_reuse_addr + bind` 成功即采用：
+
+```cpp
+static uint16_t pick_usable_port(uint16_t start) {
+    for (uint16_t p = start; p < start + 64; ++p) {
+        try {
+            coronet::tcp_socket s = coronet::tcp_socket::create_tcp(AF_INET);
+            s.set_reuse_addr(true);
+            s.bind(coronet::inet_address{p});  // 与服务器相同的绑定方式
+            return p;                          // bind 成功 → 端口可用
+        } catch (...) { /* WSAEACCES / EADDRINUSE → 试下一个 */ }
+    }
+    return start;  // 兜底，保持原行为
+}
+```
+
+按**当前实际可绑定状态**选端口，适应排除段动态变化；Linux 上第一个候选端口直接成功，行为不变。
+
+### 修复 B：tls_socket 协程参数改引用传递
+
+| 文件 | 修改 |
+|------|------|
+| `test/tls_echo_test.cpp` | `tls_echo_session(coronet::tls_socket& conn)`，调用处 `co_await tls_echo_session(conn)`（conn 存活期覆盖会话） |
+| `examples/tls_echo_server.cpp` | `tls_session(tls_socket&& conn)`，内部 `tls_socket sock = std::move(conn)` 移入本地（co_spawn 分离场景需保留所有权） |
+| `include/coronet/net/tls/tls_socket.hpp` | 类文档注明 MSVC 限制：tls_socket 勿按值作为协程参数 |
+
+---
+
+## 为什么这么解决？
+
+### 替代方案及驳回理由
+
+1. **固定换端口**（如 18080）：排除段是 WSL2 每次启动动态生成的，下次重启可能再次命中，治标不治本。
+2. **解析 netsh 输出避开保留段**：依赖外部命令输出格式，脆弱。
+3. **改 tls_socket 结构缩小体积**（raw_buf_ 改指针）：侵入性大，且不能保证避开 MSVC 该代码生成路径。
+4. **库内强制处理**：bug 在用户代码的调用形态（按值传参），库无法拦截；文档注明 + 示例示范正确写法即可。
+
+### 当前方案的优势
+
+1. 动态选端口按真实 bind 结果决策，任何系统状态都正确
+2. 引用传递零拷贝、零额外分配，同时规避 MSVC 代码生成 bug
+3. 改动最小（2 个调用点 + 1 处文档），API 不变
+
+### 验证结果
+
+```
+修复前:
+  tls_echo_test  Failed (1.94s)  — server failed to start (WSAEACCES @9443)
+  修复端口后:  0xC0000005 访问冲突 — tls_echo_server 协程按值传参 memcpy 地址截断
+
+修复后 (Windows):
+  === TLS Echo Integration Test PASSED ===   (3 次连续运行 EXITCODE=0)
+  [setup] using test port 9450        ← 自动避开保留段 9350-9449
+  [client] received 24 bytes: 'Hello, coronet TLS echo!'   ← echo 回环正确
+  cdb 下运行无任何异常
+```
+
+---
+
+# Bug 修复记录：async_io_iso_stress ISO 路径配置错误（0xC0000409 快速失败）
+
+**日期**: 2026-08-01  
+**分支**: build/win（coronetwin worktree）  
+**影响范围**: Windows 平台文件 I/O 压测（与 Linux epoll/io_uring 无关）
+
+---
+
+## Bug 描述
+
+CTest `stress-test/async_io_iso_stress.cpp`（Windows）快速失败：
+
+```
+30/34 Test #31: async_io_iso_stress ..............Exit code 0xc0000409***Exception:   1.50 sec
+```
+
+输出在 `=== Phase 1: Sequential Read 5GB ===` 后立即终止，无任何阶段输出。
+
+## 为什么会发生这个 Bug？
+
+测试的 Windows ISO 路径是数据文件迁移前遗留的陈旧路径：
+
+```cpp
+// 修改前 (async_io_iso_stress.cpp:51)
+static const char* ISO_PATH =
+    "D:/dev/workspace/yidaoyun/coronet-win/data/windows_10_professional_x64_2026.iso";
+```
+
+- `D:/dev/workspace/yidaoyun/coronet-win/data/` 目录不存在（worktree 实为 `coronetwin`，且 ISO 已随提交 `e28c53a mv test data files` 移走）
+- `std::filesystem::file_size(ISO_PATH)` 对不存在的路径抛 `filesystem_error` → main 未捕获 → `std::terminate` → abort（0xC0000409）
+- 1.50s = 快速失败（异常在首个阶段立即抛出）
+- Linux 路径（`/mnt/d/dev/Downloads/...`）一直正确，因此仅 Windows 失败
+
+## 怎么解决的？
+
+修正 Windows 路径指向实际文件位置：
+
+```cpp
+// 修改后
+static const char* ISO_PATH = "D:/dev/Downloads/windows_10_professional_x64_2026.iso";
+```
+
+## 验证结果
+
+```
+修复前:  0xC0000409 快速失败 (1.50s)，无阶段输出
+修复后:  === ALL PHASES PASSED (total 49811ms) ===  (EXITCODE=0)
+  Phase 1 顺序读 4.24GB @102MB/s，哈希校验通过
+  Phase 2 随机读 200/200 OK；Phase 3 链式 read&&read 通过
+  Phase 4 写 100MB + 读回验证通过；Phase 5 混合 chunk 7/7
+  Phase 6 timeout 513ms / yield×100 225us
+```
+
+---
+
+# Bug 修复记录：cp_tool / ISO 测试路径硬编码（Windows 与 Linux 未区分）
+
+**日期**: 2026-08-01  
+**分支**: build/win（coronetwin）+ build/linux（coronet）双 worktree  
+**影响范围**: cp_tool 压测工具及 CTest 自动化（ISO 测试文件路径）
+
+---
+
+## Bug 描述
+
+CTest `stress-test/cp_tool`（双平台）快速失败：
+
+```
+31/34 Test #32: cp_tool ..........................***Failed    0.05 sec
+  src:    /home/shiqing/workspace/Downloads/windows_10_professional_x64_2026.iso
+FAIL: source file not found
+```
+
+## 为什么会发生这个 Bug？
+
+自动化硬编码了路径但**未区分平台**，且路径已随数据迁移过时：
+
+1. **stress-test/CMakeLists.txt**（双 worktree 相同，自动化默认值）：
+   - `CP_TOOL_SRC = "/home/shiqing/workspace/Downloads/..."` — 目录不存在（ISO 实际在 `/mnt/d/dev/Downloads/`）
+   - `CP_TOOL_DST = "/mnt/c/Users/10580/AppData/..."` — 仅 WSL 视角有效，Windows 原生构建下是无效路径
+2. **cp_tool.cpp 内置默认值**（无参数运行时使用）：
+   - `DEFAULT_SRC = "D:/dev/workspace/yidaoyun/coronet-win/data/..."` — 与 async_io_iso_stress 相同的陈旧路径（`coronet-win/data` 不存在，ISO 已随 `e28c53a mv test data files` 移走）
+
+ISO 实际位置：`/mnt/d/dev/Downloads/windows_10_professional_x64_2026.iso`（WSL 视角）= `D:/dev/Downloads/...`（Windows 视角）。
+
+## 怎么解决的？
+
+**CMakeLists.txt**（双 worktree）— 按平台设置自动化默认值，仍可用 `-D` 覆盖：
+
+```cmake
+if(WIN32)
+    set(CP_TOOL_DEFAULT_SRC "D:/dev/Downloads/windows_10_professional_x64_2026.iso")
+    set(CP_TOOL_DEFAULT_DST "C:/Users/10580/AppData/windows_10_professional_x64_2026.iso")
+else()
+    set(CP_TOOL_DEFAULT_SRC "/mnt/d/dev/Downloads/windows_10_professional_x64_2026.iso")
+    set(CP_TOOL_DEFAULT_DST "/mnt/c/Users/10580/AppData/windows_10_professional_x64_2026.iso")
+endif()
+set(CP_TOOL_SRC "${CP_TOOL_DEFAULT_SRC}" CACHE STRING "cp_tool: source file path")
+set(CP_TOOL_DST "${CP_TOOL_DEFAULT_DST}" CACHE STRING "cp_tool: destination file path")
+```
+
+**cp_tool.cpp**（双 worktree）— 内置默认值按平台区分（与 async_io_iso_stress 相同的 `#ifdef` 模式）：
+
+```cpp
+#ifdef _WIN32
+static std::string DEFAULT_SRC = "D:/dev/Downloads/windows_10_professional_x64_2026.iso";
+#else
+static std::string DEFAULT_SRC = "/mnt/d/dev/Downloads/windows_10_professional_x64_2026.iso";
+#endif
+```
+
+## 注意：已有构建目录的缓存
+
+`CP_TOOL_SRC/DST` 是 CACHE 变量，旧构建目录（如 build-verify）缓存了旧值，需清除后重新配置：
+
+```bash
+cmake -U CP_TOOL_SRC -U CP_TOOL_DST build-verify && cmake -S . -B build-verify ...
+```
+
+## 验证结果
+
+```
+Windows（CTest 完整流程参数）:
+  src:    D:/dev/Downloads/windows_10_professional_x64_2026.iso
+  dst:    C:/Users/10580/AppData/windows_10_professional_x64_2026.iso
+  copy: 4554194944 bytes (4.24 GB) in 5941ms (731 MB/s), 1086 chunks
+  verify: 1086 chunks checked, 0 mismatches
+  === ALL PASSED (total 23453ms) ===   (EXITCODE=0)
+
+Windows（无参数运行，验证 DEFAULT_SRC 修复）:
+  默认源 D:/dev/Downloads/... 找到并复制成功
+Linux: CMakeLists / cp_tool.cpp 同步修复（ISO 路径 /mnt/d/dev/Downloads/... 存在）
+```
+
+---
+
+# Bug 修复记录：stress_driver redistools 路径解析（build-xxx 布局找不到工具）
+
+**日期**: 2026-08-01  
+**分支**: build/win（coronetwin）+ build/linux（coronet）双 worktree  
+**影响范围**: stress_driver 压测驱动（redis-cli / redis-benchmark 定位）
+
+---
+
+## Bug 描述
+
+CTest `stress_driver_ST` / `stress_driver_MT`（Windows）全部服务器报 "port not ready"：
+
+```
+  coronet_ST    [port 17080] FAIL (port not ready)
+  coronet_chain [port 17081] FAIL (port not ready)
+  ASIO_ST       [port 17082] FAIL (port not ready)
+```
+
+耗时与探测超时吻合（3 服务器 × 10s ≈ 33.56s）。
+
+## 为什么会发生这个 Bug？
+
+driver 对 redis 工具的查找路径硬编码两层相对路径：
+
+```cpp
+auto redistools = get_exe_dir() / ".." / ".." / "redistools" / "redis-cli";
+```
+
+- driver 位于 `<build>/stress-test/stress_driver.exe`，`../..` 解析到**构建目录根**，即查找 `<build>/redistools/`
+- 该布局只对 `<repo>/build`（一层目录名）有效；`buildmsvc/`、`build-verify/` 等构建目录无法命中仓库根的 `redistools/`
+- 工具（`redis-cli.exe` / `redis-benchmark.exe`）实际位于仓库根 `redistools/` → 找不到 → 兜底裸名走 PATH 也失败 → `redis-cli ping` 永远无 PONG → 全部 "port not ready"
+- 服务器进程本身正常（实测 `PING` → `+PONG`）
+- 注：`script/win/bench_c1000k.ps1` 用**向上搜索**策略，不受影响
+
+## 怎么解决的？
+
+`stress_driver.cpp`（双 worktree）新增 `find_redistools_dir()` 向上搜索（与 bench_c1000k.ps1 策略一致），三个查找函数（`has_redis_benchmark` / `find_redis_benchmark` / `find_redis_cli`）统一改用：
+
+```cpp
+static std::filesystem::path find_redistools_dir() {
+    auto dir = get_exe_dir();
+    for (int i = 0; i < 10; ++i) {
+        std::error_code ec;
+        auto cand = dir / "redistools";
+        if (std::filesystem::is_directory(cand, ec) && !ec) return cand;
+        auto parent = dir.parent_path();
+        if (parent == dir || parent.empty()) break;
+        dir = parent;
+    }
+    return {};
+}
+```
+
+保留同目录与 PATH 兜底。Linux 侧同步修复（`build-release/` 等布局同样受益）。
+
+## 验证结果
+
+```
+Windows（build-verify 布局，等价 CTest 参数）:
+  coronet_ST    [17080] PASS  rps=49261
+  coronet_chain [17081] PASS  rps=52356
+  ASIO_ST       [17082] PASS  rps=50505
+  TOTAL: 3 passed, 0 failed
+
+  coronet_MT    [17090] PASS  rps=56497
+  ASIO_MT       [17091] PASS  rps=28902
+  TOTAL: 2 passed, 0 failed
+```
+
+---
+
+# Bug 修复记录：Windows IOCP 定时器精度差（timeBeginPeriod 1ms 分辨率）
+
+**日期**: 2026-08-01  
+**分支**: build/win（coronetwin）+ build/linux（coronet）双 worktree  
+**影响范围**: Windows IOCP 路径全部定时器（async::timeout / timeout_at）
+
+---
+
+## Bug 描述
+
+CTest `timer_accuracy` Passed，但精度差很多 —— 3 轮 1s 绝对时间点超时的实际唤醒延迟：
+
+```
+round 1: late = 9.237 ms
+round 2: late = 2.603 ms
+round 3: late = 14.510 ms
+```
+
+`timer.exe` 佐证：1s 定时实际 elapsed 1006/1007/1013ms。测试仅因 50ms WSL 容忍阈值才通过。
+
+## 为什么会发生这个 Bug？
+
+**Windows 系统定时器分辨率默认 15.625ms（64 tick/s）**：
+
+- `SetWaitableTimer` 的到期时间被量化到下一个系统 tick → 触发误差 0~15.6ms（均匀分布，实测 2.6/14.5ms 完全吻合）
+- Linux 侧 timerfd / IORING_OP_TIMEOUT 是内核高精度定时器（亚毫秒），对比之下"精度差很多"
+- 测试本身逻辑正确（绝对时间点链式定时、累计误差暴露、PASSED/WARNING 语义合理），缺陷在实现：
+  - `timeout_at` 用 ns 精度计算差值 → `win_timeout` 截断到 ms（≤1ms，可忽略）
+  - 定时器线程 `arm_timer_locked()` 以 µs 精度武装 waitable timer（100ns 单位，无武装误差）
+  - 事件循环 worker `GQCS(INFINITE)` 阻塞，完成事件投递后立即唤醒（µs 级，无轮询粒度损失）
+  - **唯一大误差项 = SetWaitableTimer 被 15.625ms tick 量化**
+
+## 怎么解决的？
+
+`win_timer_thread` 单例构造时调用 `timeBeginPeriod(1)`，将系统定时器分辨率提升到 1ms（node.js / boost.asio 通行做法）：
+
+```cpp
+win_timer_thread() noexcept
+    : pulse_(CreateEventW(nullptr, FALSE, FALSE, nullptr)),  // auto-reset
+      timer_(CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS)),
+      thread_([this] { worker(); }) {
+    ::timeBeginPeriod(1);   // 15.625ms → 1ms tick
+}
+```
+
+- `#include <timeapi.h>`（iocp_win_io.hpp）+ `winmm` 链接（cmake/Platform.cmake WIN32 分支）
+- 泄漏式单例 → 进程存活期间保持 1ms，不配对 `timeEndPeriod`（进程退出时 OS 自动清零计数器）
+- 副效果：deinit drain 中 `GQCS(1ms)` 每轮实际耗时从 ~10-15.6ms 变为 ~1ms（此前 drain 慢的根因之一）
+
+### 替代方案及驳回理由
+
+- **武装时提前半个 tick 补偿**：依赖未文档化的 tick 行为，且救不了 GQCS drain 粒度
+- **CreateTimerQueueTimer**：仍受系统 tick 量化影响，且多线程池开销更大
+- **放宽测试阈值**：掩盖实现缺陷，不做
+
+## 验证结果
+
+```
+Windows（buildmsvc，修复后实测）:
+  timer_accuracy: round late = 0.967 / -0.734 / -0.091 ms（修复前 9.2 / 2.6 / 14.5 ms）
+  timer.exe:      elapsed 1000/1000/1000ms、3001ms（修复前 1006-1013ms）
+  combinator_stress: ALL PASSED, exit=0, 总耗时 5.3s（修复前 6.25s）
+
+Linux: iocp_win_io.hpp / Platform.cmake 已同步（Windows-only 代码，epoll/io_uring 路径零接触）
 ```
