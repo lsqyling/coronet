@@ -78,6 +78,31 @@ private:
     bool is_detached_;
 };
 
+// ============================================================
+// frame_pool — per-thread coroutine frame recycling (B2)
+// ============================================================
+// thread_local（函数局部静态，首次 operator new 调用时构造，
+// 线程退出时析构并排空剩余帧）。按尺寸精确匹配复用；帧内存是原始字节，
+// 由新协程的 promise 就地构造，尺寸/对齐匹配即可安全复用。
+// 最多保留 kSlots 帧/线程；满则直接 ::operator delete。
+struct frame_pool {
+    static constexpr std::size_t kSlots = 8;
+    struct slot { void* ptr; std::size_t size; };
+    slot slots[kSlots]{};
+    std::size_t count = 0;
+
+    ~frame_pool() {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (slots[i].ptr) ::operator delete(slots[i].ptr);
+        }
+    }
+
+    static frame_pool& instance() {
+        static thread_local frame_pool p;
+        return p;
+    }
+};
+
 /**
  * @brief Define the behavior of all tasks.
  *
@@ -89,6 +114,45 @@ class task_promise_base
     friend struct task_final_awaiter<T>;
 public:
     task_promise_base() noexcept = default;
+
+    // ---- 协程帧回收池（吸收 asio thread_info_base 设计）----
+    // Frame recycling pool (adopts asio's thread_info_base design).
+    // 短生命周期任务（连接风暴、httpd 短连接、combinator 中间任务）的帧
+    // 频繁 new/delete；per-thread 按尺寸空闲链表复用可减少分配次数与堆碎片。
+    // 长连接场景帧存活期间不入池，无影响。
+    // 注意：MT 下帧可能在线程 A 分配、线程 B 释放（跨线程 co_spawn），
+    // 池是 thread_local 的 —— 释放进 B 的池、分配从当前线程池取，天然安全
+    // （帧内存是原始字节，尺寸匹配即可复用；内容已由运行时析构）。
+    // 过对齐帧走 aligned operator new，不入池（下方 aligned 重载直接转发）。
+    static void* operator new(std::size_t size) {
+        auto& p = detail::frame_pool::instance();
+        for (std::size_t i = 0; i < p.count; ++i) {
+            if (p.slots[i].size == size) {
+                void* mem = p.slots[i].ptr;
+                p.slots[i] = p.slots[--p.count];
+                return mem;
+            }
+        }
+        return ::operator new(size);
+    }
+    static void operator delete(void* ptr, std::size_t size) noexcept {
+        auto& p = detail::frame_pool::instance();
+        if (p.count < detail::frame_pool::kSlots) {
+            p.slots[p.count++] = {ptr, size};
+            return;
+        }
+        ::operator delete(ptr);
+    }
+    static void* operator new(std::size_t size, std::align_val_t al) {
+        return ::operator new(size, al);
+    }
+    static void operator delete(void* ptr, std::align_val_t al) noexcept {
+        ::operator delete(ptr, al);
+    }
+    static void operator delete(void* ptr, std::size_t,
+                                std::align_val_t al) noexcept {
+        ::operator delete(ptr, al);
+    }
 
     // 协程的"启动按钮"
     // Lazy: suspend_always → 等待被 co_await 时才执行
