@@ -53,7 +53,14 @@ struct task_final_awaiter<void>
     // runtime destroys the frame automatically, avoiding the need
     // to call current.destroy() inside await_suspend (which MSVC's
     // runtime does not support — it accesses the frame afterwards).
-    bool is_detached_ = false;
+    //
+    // P2-1 fix: 从 promise 显式注入 is_detached_（成员默认初始化 {false}，
+    // 确定性无垃圾值）。P0-2 曾因 MSVC 帧内 flag 未初始化误判 detached，
+    // 移除了检查导致所有 detached 帧在 final_suspend 挂起后句柄被 detach()
+    // 清空，帧永久孤儿化泄漏（C1000K 每连接 +4.4KB，三端一致）。
+    // 构造函数注入保证 flag 与 promise 状态同步，重新启用自动销毁。
+    explicit constexpr task_final_awaiter(bool is_detached) noexcept
+        : is_detached_(is_detached) {}
 
     constexpr bool await_ready() const noexcept {
         return is_detached_;
@@ -66,6 +73,9 @@ struct task_final_awaiter<void>
         return current.promise().parent_coroutine;
     }
     constexpr void await_resume() const noexcept {}
+
+private:
+    bool is_detached_;
 };
 
 /**
@@ -322,14 +332,14 @@ public:
 
     constexpr void return_void() const noexcept {}
 
-    // P0-2 fix: 移除 final_suspend 中的 is_detached_ 检查。
-    // is_detached_ 在协程帧中可能未正确初始化（MSVC bug），
-    // 导致非 detached 任务被误判为 detached，帧被运行时自动销毁，
-    // 父协程永不恢复（when_all void 路径死锁 10 秒直到 stopper 超时）。
-    // 替代方案：detached 任务在 final_suspend 挂起，
-    // 由 drain_residual_coroutines 或 io_context 析构清理。
+    // P2-1 fix: final_suspend 从 promise 的 is_detached_（成员默认初始化
+    // {false}，无垃圾值）构造 final awaiter，重新启用 detached 帧的运行时
+    // 自动销毁。P0-2 曾因 MSVC 帧内 flag 未初始化误判 detached（when_all
+    // void 路径死锁）而移除检查，代价是 detached 帧在 final_suspend 挂起后
+    // 句柄被 detach() 清空 → 帧永久孤儿化泄漏（C1000K 每连接 +4.4KB）。
+    // 构造函数注入保证确定性初始化，且 final_awaiter 不再有独立默认成员。
     constexpr task_final_awaiter<void> final_suspend() const noexcept {
-        return {};
+        return task_final_awaiter<void>{is_detached_};
     }
 
     // P0-2 fix: 不在 unhandled_exception 中 rethrow（即使 is_detached_ 为 true）。
