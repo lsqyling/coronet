@@ -114,11 +114,12 @@ task<> tls_client(const char* host) {
 ## ⚡ 快速开始
 
 ```bash
-# 克隆（含子模块）
-git clone --recursive https://github.com/lsqyling/coronet.git && cd coronet
+# 克隆
+git clone https://github.com/lsqyling/coronet.git && cd coronet
 
-# 已克隆但未拉取子模块时：
-git submodule update --init --recursive
+# 外部依赖（googletest / benchmark / asio）无需手动拉取：
+#   首次 configure 时自动下载（FetchContent）
+#   若 extern/ 目录已预置源码则直接使用（离线可用）
 
 # Linux — 默认 epoll 后端(Release)
 cmake -S . -B build -G Ninja

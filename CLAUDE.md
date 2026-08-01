@@ -21,6 +21,14 @@ cmake -B build && cmake --build build --config Release
 cmake -S . -B build-release -DCORONET_BUILD_EXAMPLES=ON -DCORONET_BUILD_BENCHMARKS=ON
 ```
 
+## Dependencies
+
+External deps (googletest / benchmark / asio) are NOT git submodules:
+- Prefer pre-fetched source under `extern/` (works offline)
+- Otherwise FetchContent downloads automatically at first configure (needs network)
+- Version pins: googletest `v1.15.2`, benchmark `v1.9.1`, asio `bd500f0a` (GitHub archive URL)
+- Share one download cache across build dirs: `-DFETCHCONTENT_BASE_DIR=/path/to/_deps`
+
 ## Test
 
 ```bash

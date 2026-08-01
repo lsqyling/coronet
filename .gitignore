@@ -39,3 +39,6 @@ compile_commands.json
 
 # test big data
 data/*.iso
+
+# External deps: optional local pre-fetch (FetchContent primary)
+extern/

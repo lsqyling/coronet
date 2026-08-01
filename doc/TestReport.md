@@ -611,11 +611,7 @@ ctest --test-dir buildmsvc-release -C Release --output-on-failure
 ```
 
 **Q: ASIO 对比测试被跳过？**
-ASIO 是可选子模块。确保拉取：
-```bash
-git submodule update --init --recursive
-```
-检查 `extern/asio/asio/include/asio.hpp` 是否存在。不存在时 `CORONET_HAS_ASIO=FALSE`，ASIO 服务端不编译。
+ASIO 是可选依赖，首次 configure 时 FetchContent 自动下载（或手动放入 `extern/asio`）。检查 `extern/asio/asio/include/asio.hpp`（或构建目录 `_deps/asio-src/asio/include/asio.hpp`）是否存在。不存在时 `CORONET_HAS_ASIO=FALSE`，ASIO 服务端不编译。
 
 **Q: 如何只编译不运行测试？**
 ```bash
