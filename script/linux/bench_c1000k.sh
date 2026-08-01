@@ -3,18 +3,16 @@
 # Coronet vs ASIO C1000K Benchmark Script (Linux / WSL)
 # ============================================================
 # Copy to build output dir during CMake build. Run directly:
-#   cd build-release/stress-test
 #   bash bench_c1000k.sh
 #   bash bench_c1000k.sh 2000000 2000    # custom requests/clients
+# Report/CSV data files always land in build/data/ (build root found by
+# searching upward from this script), no matter where you run it from.
 # ============================================================
 
 set -e
 
 REQUESTS=${1:-1000000}
 CLIENTS=${2:-1000}
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-REPORT="bench_report_${TIMESTAMP}.txt"
-CSV="bench_report_${TIMESTAMP}.csv"
 
 # Script is copied to build/script/linux/ — find binaries in build/stress-test/
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +24,13 @@ while [ "$BUILD_DIR" != "/" ] && [ ! -d "$BUILD_DIR/stress-test" ]; do
 done
 # Binary directory is build/stress-test/
 BIN_DIR="${BUILD_DIR}/stress-test"
+
+# Data files always go to build/data/ regardless of invocation directory
+DATA_DIR="${BUILD_DIR}/data"
+mkdir -p "$DATA_DIR"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REPORT="${DATA_DIR}/bench_report_${TIMESTAMP}.txt"
+CSV="${DATA_DIR}/bench_report_${TIMESTAMP}.csv"
 
 # Find repo root by searching upward for "redistools"
 REPO_ROOT="$BUILD_DIR"
@@ -60,6 +65,7 @@ else
 fi
 
 echo "Build dir:  $BUILD_DIR"
+echo "Data dir:   $DATA_DIR"
 echo "Redis dir:  $REDIS_DIR"
 echo ""
 
@@ -84,6 +90,7 @@ echo "  Requests: $REQUESTS" | tee -a "$REPORT"
 echo "  Clients:  $CLIENTS" | tee -a "$REPORT"
 echo "  Pipeline: 1 (no pipelining)" | tee -a "$REPORT"
 echo "  Build:    $BUILD_DIR" | tee -a "$REPORT"
+echo "  Data:     $DATA_DIR" | tee -a "$REPORT"
 echo "============================================================" | tee -a "$REPORT"
 echo "Name,Port,RPS,CPU%,MemMB,Status,ElapsedSec" > "$CSV"
 

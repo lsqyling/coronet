@@ -2,14 +2,15 @@
 # Coronet vs ASIO C1000K Benchmark Script (Windows PowerShell)
 # ============================================================
 # Copy to build output dir during CMake build. Run directly:
-#   cd buildmsvc-release\stress-test
 #   powershell -ExecutionPolicy Bypass -File bench_c1000k.ps1
+# Report/CSV data files always land in build/data/ (build root found by
+# searching upward from this script), no matter where you run it from.
 # ============================================================
 
 param(
     [int]$Requests     = 1000000,   # 1M requests
     [int]$Clients      = 1000,      # 1000 concurrent
-    [string]$OutputDir = ".",
+    [string]$OutputDir = "",        # empty = build/data/ (default, same as Linux)
     [switch]$KeepTempFiles = $false # keep stderr logs for debugging
 )
 
@@ -30,6 +31,14 @@ while ($BuildDir -and -not (Test-Path (Join-Path $BuildDir "stress-test"))) {
 }
 # Binary directory is build/stress-test/
 $BinDir = Join-Path $BuildDir "stress-test"
+
+# Data files always go to build/data/ unless an explicit -OutputDir is given
+if ([string]::IsNullOrEmpty($OutputDir)) {
+    $OutputDir = Join-Path $BuildDir "data"
+}
+if (-not (Test-Path $OutputDir)) {
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
 
 # Find repo root by searching upward for "redistools"
 $RepoRoot = $BuildDir
@@ -61,6 +70,7 @@ if (-not (Test-Path $RedisBench)) {
 }
 
 Write-Host "Build dir:  $BuildDir"
+Write-Host "Data dir:   $OutputDir"
 Write-Host "Redis dir:  $RedisDir"
 Write-Host ""
 
