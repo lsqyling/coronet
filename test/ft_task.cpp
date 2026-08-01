@@ -221,9 +221,11 @@ task<> coro_detach() {
     // Resume the detached handle so it runs to completion
     h1.resume();
     assert(executed);
-    // FIX: clean up the suspended frame (final_suspend leaves it suspended)
-    // Without this, the coroutine frame leaks (detached + at final_suspend = no owner)
-    if (h1.done()) h1.destroy();
+    // P2-1 fix: detached task 在 final_suspend 由运行时自动销毁
+    // （await_ready()==true → 帧自动释放），不再有"无主帧泄漏"。
+    // 手动 destroy 会对已自动销毁的帧二次释放（double free）。
+    // P2-1: detached tasks are auto-destroyed by the runtime at
+    // final_suspend — do NOT call h1.destroy() afterwards.
     TEST_PASS();
 
     // Non-void task detach is intentionally disabled (compile-time constrained).
