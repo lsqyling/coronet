@@ -1,5 +1,5 @@
 # ============================================================
-# External dependencies (bundled in extern/)
+# External dependencies (extern/ or FetchContent)
 # ============================================================
 
 # ---- liburingcxx (only when CORONET_IOURING=ON) ----
@@ -107,16 +107,49 @@ if(CORONET_USE_MIMALLOC)
 endif()
 
 # ---- googletest (for unit tests) ----
-if(CORONET_BUILD_TESTS AND EXISTS "${PROJECT_SOURCE_DIR}/extern/googletest/CMakeLists.txt")
+# 策略：优先使用 extern/ 目录（离线/已预置），缺失则 FetchContent 下载。
+# 与 liburingcxx/OpenSSL 的处理逻辑对齐，三端（iocp/io_uring/epoll）一致。
+if(CORONET_BUILD_TESTS)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-    add_subdirectory(extern/googletest EXCLUDE_FROM_ALL)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    if(EXISTS "${PROJECT_SOURCE_DIR}/extern/googletest/CMakeLists.txt")
+        add_subdirectory(extern/googletest EXCLUDE_FROM_ALL)
+        message(STATUS "coronet: using bundled googletest (extern/)")
+    else()
+        # FetchContent 从 GitHub 下载
+        message(STATUS "coronet: extern/googletest not found, trying FetchContent...")
+        include(FetchContent)
+        FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            GIT_TAG        v1.15.2   # 与 submodule pin 一致
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(googletest)
+        message(STATUS "coronet: using googletest via FetchContent (v1.15.2)")
+    endif()
 endif()
 
 # ---- Google Benchmark (for performance tests) ----
-if(CORONET_BUILD_BENCHMARKS AND EXISTS "${PROJECT_SOURCE_DIR}/extern/benchmark/CMakeLists.txt")
+# 策略：优先使用 extern/ 目录（离线/已预置），缺失则 FetchContent 下载。
+if(CORONET_BUILD_BENCHMARKS)
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
-    add_subdirectory(extern/benchmark)
+    if(EXISTS "${PROJECT_SOURCE_DIR}/extern/benchmark/CMakeLists.txt")
+        add_subdirectory(extern/benchmark)
+        message(STATUS "coronet: using bundled Google Benchmark (extern/)")
+    else()
+        # FetchContent 从 GitHub 下载
+        message(STATUS "coronet: extern/benchmark not found, trying FetchContent...")
+        include(FetchContent)
+        FetchContent_Declare(
+            benchmark
+            GIT_REPOSITORY https://github.com/google/benchmark.git
+            GIT_TAG        v1.9.1    # 与 submodule pin 一致
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(benchmark)
+        message(STATUS "coronet: using Google Benchmark via FetchContent (v1.9.1)")
+    endif()
 endif()

@@ -5,9 +5,31 @@
 # stress_driver 代码无需修改。
 
 # ---- ASIO (conditional) ----
+# 策略：优先使用 extern/asio（离线/已预置），缺失则 FetchContent 下载。
+# asio 是 header-only 项目，仓库没有根 CMakeLists.txt（autotools 构建），
+# 因此 FetchContent 只下载源码（MakeAvailable 对无 CMakeLists.txt 的依赖
+# 不会 add_subdirectory，CMake >= 3.18），沿用下方 INTERFACE target。
+# GIT_SHALLOW + GIT_TAG=SHA 在 CMake 4.x 有 bug（unable to read tree），
+# 故改用 GitHub archive URL（支持任意 SHA），三端（iocp/io_uring/epoll）一致。
 if(EXISTS "${PROJECT_SOURCE_DIR}/extern/asio/asio/include/asio.hpp")
+    set(asio_SOURCE_DIR "${PROJECT_SOURCE_DIR}/extern/asio")
+    message(STATUS "coronet: using bundled asio (extern/)")
+else()
+    message(STATUS "coronet: extern/asio not found, trying FetchContent...")
+    include(FetchContent)
+    FetchContent_Declare(
+        asio
+        URL https://github.com/chriskohlhoff/asio/archive/bd500f0a018db9a845ebaaed5c0318343ae9f497.tar.gz
+        URL_HASH SHA256=ffbe2bf0afd64467157d41307aeddbf7f0213f2a0f173583bc594f5ffe66447f
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(asio)
+    message(STATUS "coronet: using asio via FetchContent (bd500f0a)")
+endif()
+
+if(EXISTS "${asio_SOURCE_DIR}/asio/include/asio.hpp")
     add_library(asio INTERFACE)
-    target_include_directories(asio INTERFACE "${PROJECT_SOURCE_DIR}/extern/asio/asio/include")
+    target_include_directories(asio INTERFACE "${asio_SOURCE_DIR}/asio/include")
     target_compile_definitions(asio INTERFACE ASIO_STANDALONE)
     set(CORONET_HAS_ASIO TRUE)
 else()
