@@ -9,6 +9,9 @@ option(CORONET_BUILD_TESTS "Build unit tests (gtest)" OFF)
 option(CORONET_BUILD_BENCHMARKS "Build benchmarks (Google Benchmark)" OFF)
 option(CORONET_BUILD_STRESS_TESTS "Build stress/load tests (redis-benchmark or redis_loadgen)" OFF)
 option(CORONET_BUILD_EXAMPLES "Build examples" OFF)
+# 对成熟的第三方库（benchmark 等）跳过配置期编译器特性探测（try_compile/try_run）。
+# 仅对已知工具链生效（GCC/Clang on Linux, MSVC on Windows），其余工具链照常探测。
+option(CORONET_SKIP_DEPS_CHECKS "Skip configure-time feature probes of mature third-party deps" ON)
 # ---- 自动检测 git 分支, main/master 默认关闭开发模式 ----
 execute_process(
     COMMAND git rev-parse --abbrev-ref HEAD

@@ -23,11 +23,16 @@ cmake -S . -B build-release -DCORONET_BUILD_EXAMPLES=ON -DCORONET_BUILD_BENCHMAR
 
 ## Dependencies
 
-External deps (googletest / benchmark / asio) are NOT git submodules:
-- Prefer pre-fetched source under `extern/` (works offline)
-- Otherwise FetchContent downloads automatically at first configure (needs network)
-- Version pins: googletest `v1.15.2`, benchmark `v1.9.1`, asio `bd500f0a` (GitHub archive URL)
-- Share one download cache across build dirs: `-DFETCHCONTENT_BASE_DIR=/path/to/_deps`
+External deps (googletest / benchmark / asio / liburingcxx) are NOT git submodules:
+- Resolution order for all deps: system `find_package` → FetchContent download,
+  cached in `extern/_deps-<OS>/` (gitignored) — downloaded once, reused thereafter
+- asio resolves via `find_package(asio)` (standalone, e.g. vcpkg's `asio::asio`), else FetchContent
+- Version pins: googletest `v1.15.2`, benchmark `v1.9.1`, asio `bd500f0a` (git clone; SHA pin needs full clone — `GIT_SHALLOW`+SHA is broken in CMake 4.x)
+- Download cache fixed to `extern/_deps-<OS>/` (gitignored), shared across build dirs
+  of the same OS — WSL and native Windows use separate caches (`/mnt/d/...` vs `D:/...`
+  path mismatch would break FetchContent)
+- Mature deps skip configure-time feature probes (`CORONET_SKIP_DEPS_CHECKS=ON` default,
+  known toolchains only); liburingcxx's kernel ABI probes always run (machine-dependent)
 
 ## Test
 

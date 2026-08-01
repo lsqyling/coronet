@@ -5,31 +5,42 @@
 # stress_driver 代码无需修改。
 
 # ---- ASIO (conditional) ----
-# 策略：优先使用 extern/asio（离线/已预置），缺失则 FetchContent 下载。
+# 策略：优先 find_package 独立 asio（如 vcpkg/Conan 提供 asio::asio），缺失则
+# FetchContent 下载（缓存在 extern/_deps-<OS>/，首次下载后复用）。
 # asio 是 header-only 项目，仓库没有根 CMakeLists.txt（autotools 构建），
 # 因此 FetchContent 只下载源码（MakeAvailable 对无 CMakeLists.txt 的依赖
-# 不会 add_subdirectory，CMake >= 3.18），沿用下方 INTERFACE target。
-# GIT_SHALLOW + GIT_TAG=SHA 在 CMake 4.x 有 bug（unable to read tree），
-# 故改用 GitHub archive URL（支持任意 SHA），三端（iocp/io_uring/epoll）一致。
-if(EXISTS "${PROJECT_SOURCE_DIR}/extern/asio/asio/include/asio.hpp")
-    set(asio_SOURCE_DIR "${PROJECT_SOURCE_DIR}/extern/asio")
-    message(STATUS "coronet: using bundled asio (extern/)")
+# 不会 add_subdirectory，CMake >= 3.18）。统一包装为 INTERFACE target `asio`
+# 供下方服务器链接；find_package 分支链接 asio::asio。
+# 历史上用 GitHub archive URL（支持任意 SHA），因为 GIT_SHALLOW + GIT_TAG=SHA
+# 在 CMake 4.x 有 bug（git clone 报 unable to read tree，实测复现）；但 URL 走
+# CMake 内部下载器，在 Windows 上会卡死（下载文件 0 字节、无进度）。故改用
+# git clone；SHA pin 不能 shallow，用全量 clone（首次下载后走共享缓存）。
+set(_asio_source_dir "")
+find_package(asio QUIET)
+if(asio_FOUND AND TARGET asio::asio)
+    message(STATUS "coronet: using system asio (find_package)")
 else()
-    message(STATUS "coronet: extern/asio not found, trying FetchContent...")
+    message(STATUS "coronet: asio not found, trying FetchContent...")
     include(FetchContent)
     FetchContent_Declare(
         asio
-        URL https://github.com/chriskohlhoff/asio/archive/bd500f0a018db9a845ebaaed5c0318343ae9f497.tar.gz
-        URL_HASH SHA256=ffbe2bf0afd64467157d41307aeddbf7f0213f2a0f173583bc594f5ffe66447f
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+        GIT_TAG        bd500f0a018db9a845ebaaed5c0318343ae9f497
+        GIT_SHALLOW    FALSE
     )
     FetchContent_MakeAvailable(asio)
+    set(_asio_source_dir "${asio_SOURCE_DIR}")
     message(STATUS "coronet: using asio via FetchContent (bd500f0a)")
 endif()
 
-if(EXISTS "${asio_SOURCE_DIR}/asio/include/asio.hpp")
+if(TARGET asio::asio)
+    # 系统独立 asio：链接 asio::asio
     add_library(asio INTERFACE)
-    target_include_directories(asio INTERFACE "${asio_SOURCE_DIR}/asio/include")
+    target_link_libraries(asio INTERFACE asio::asio)
+    set(CORONET_HAS_ASIO TRUE)
+elseif(EXISTS "${_asio_source_dir}/asio/include/asio.hpp")
+    add_library(asio INTERFACE)
+    target_include_directories(asio INTERFACE "${_asio_source_dir}/asio/include")
     target_compile_definitions(asio INTERFACE ASIO_STANDALONE)
     set(CORONET_HAS_ASIO TRUE)
 else()
