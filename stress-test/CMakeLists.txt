@@ -71,6 +71,26 @@ if(CORONET_HAS_ASIO)
         find_package(Threads REQUIRED)
         target_link_libraries(redis_echo_asio_MT PRIVATE Threads::Threads)
     endif()
+    # 协程版（C1000K 同编程模型对比）— mirrors redis_echo_ST/MT.cpp structure:
+    # per-connection coroutine frame with 4096B buffer, apples-to-apples with coronet.
+    # asio INTERFACE target 不传播 C++20 特性，需显式开启（协程依赖 __cpp_coroutines）。
+    add_executable(redis_echo_asio_coro_ST redis_echo_asio_coro_ST.cpp)
+    target_compile_features(redis_echo_asio_coro_ST PRIVATE cxx_std_20)
+    target_link_libraries(redis_echo_asio_coro_ST PRIVATE asio)
+    if(WIN32)
+        target_compile_definitions(redis_echo_asio_coro_ST PRIVATE _WIN32_WINNT=0x0A00)
+        target_link_libraries(redis_echo_asio_coro_ST PRIVATE ws2_32 mswsock)
+    endif()
+    add_executable(redis_echo_asio_coro_MT redis_echo_asio_coro_MT.cpp)
+    target_compile_features(redis_echo_asio_coro_MT PRIVATE cxx_std_20)
+    target_link_libraries(redis_echo_asio_coro_MT PRIVATE asio)
+    if(WIN32)
+        target_compile_definitions(redis_echo_asio_coro_MT PRIVATE _WIN32_WINNT=0x0A00)
+        target_link_libraries(redis_echo_asio_coro_MT PRIVATE ws2_32 mswsock)
+    else()
+        find_package(Threads REQUIRED)
+        target_link_libraries(redis_echo_asio_coro_MT PRIVATE Threads::Threads)
+    endif()
 endif()
 
 # ---- Stress driver ----
