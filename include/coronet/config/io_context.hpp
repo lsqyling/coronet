@@ -19,7 +19,6 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <bit>
 
 namespace coronet::config {
 
@@ -67,19 +66,18 @@ using cur_t = uint32_t;
  */
 inline constexpr cur_t swap_capacity = 16384;
 
-/// io_uring 默认 SQ 条目数（>= 2 * swap_capacity，2 的幂）
-/// Default io_uring entries (must be power of two, >= 2 * swap_capacity)
+/// io_uring 默认 SQ 条目数（必须是 2 的幂）
+/// Default io_uring entries (must be power of two)
 /// 也用作 epoll 的 max_events 参数
 /*
- * 使用 std::bit_ceil 自动计算大于等于 2*swap_capacity 的最小 2 的幂。
- * 设置为 swap_capacity 的两倍是因为：
- * - 一部分 SQE 用于新的 I/O 提交
- * - 另一部分留给内核处理中的 I/O 的重提交或链接操作
- * - 避免提交队列满时阻塞用户代码
- * 该值同时也作为 epoll 的 max_events 参数，确保不会丢失事件。
+ * 4096（2^12）：每个 io_context 一个 ring，条目数只须覆盖"在飞操作"峰值。
+ * C1000K 场景 1000 连接 × 1 在飞 op ≈ 1000 SQE，4096 富余且无溢出风险。
+ * 旧值 bit_ceil(2×swap_capacity)=32768 使每个 ring ≈ 4.7MB（SQE 128B +
+ * CQE 16B + 内核侧），6 worker 的 MT 场景仅 ring 就 ~28MB —— 这是
+ * C1000K io_uring MT 35MB 报告的主要来源（纯配置项，非代码问题）。
+ * 该值同时作为 epoll 的 max_events 参数（4096 事件/批足够）。
  */
-inline constexpr uint32_t default_io_uring_entries =
-    std::bit_ceil<uint32_t>(static_cast<uint32_t>(swap_capacity) * 2U);
+inline constexpr uint32_t default_io_uring_entries = 4096;
 
 /// 批量提交阈值（设为最大值表示不限制，每次事件循环都提交）
 /// Max bytes to submit in one batch (unlimited = submit every loop iteration)

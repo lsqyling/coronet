@@ -72,9 +72,9 @@ echo ""
 # Ports
 PORT_CORONET_ST=16500
 PORT_CORONET_CHAIN=16501
-PORT_ASIO_ST=16502
+PORT_ASIO_CORO_ST=16502
 PORT_CORONET_MT=16510
-PORT_ASIO_MT=16511
+PORT_ASIO_CORO_MT=16511
 
 # Colors
 RED='\033[0;31m'
@@ -194,7 +194,7 @@ echo "" | tee -a "$REPORT"
 
 test_server "coronet_ST"         "${BIN_DIR}/redis_echo_ST"        $PORT_CORONET_ST
 test_server "coronet_chain"      "${BIN_DIR}/redis_echo_chain"     $PORT_CORONET_CHAIN
-test_server "ASIO_ST"            "${BIN_DIR}/redis_echo_asio_ST"   $PORT_ASIO_ST
+test_server "ASIO_coro_ST"       "${BIN_DIR}/redis_echo_asio_coro_ST" $PORT_ASIO_CORO_ST
 
 # ============================================================
 # Round 2: Multi-Threaded (6 threads)
@@ -204,7 +204,7 @@ echo -e "${CYAN}=== Round 2: Multi-Threaded (6 threads) ===${NC}" | tee -a "$REP
 echo "" | tee -a "$REPORT"
 
 test_server "coronet_MT(6)"      "${BIN_DIR}/redis_echo_MT"  $PORT_CORONET_MT "6"
-test_server "ASIO_MT(6)"         "${BIN_DIR}/redis_echo_asio_MT" $PORT_ASIO_MT "6"
+test_server "ASIO_coro_MT(6)"    "${BIN_DIR}/redis_echo_asio_coro_MT" $PORT_ASIO_CORO_MT "6"
 
 # ============================================================
 # Summary

@@ -53,7 +53,14 @@ struct task_final_awaiter<void>
     // runtime destroys the frame automatically, avoiding the need
     // to call current.destroy() inside await_suspend (which MSVC's
     // runtime does not support — it accesses the frame afterwards).
-    bool is_detached_ = false;
+    //
+    // P2-1 fix: 从 promise 显式注入 is_detached_（成员默认初始化 {false}，
+    // 确定性无垃圾值）。P0-2 曾因 MSVC 帧内 flag 未初始化误判 detached，
+    // 移除了检查导致所有 detached 帧在 final_suspend 挂起后句柄被 detach()
+    // 清空，帧永久孤儿化泄漏（C1000K 每连接 +4.4KB，三端一致）。
+    // 构造函数注入保证 flag 与 promise 状态同步，重新启用自动销毁。
+    explicit constexpr task_final_awaiter(bool is_detached) noexcept
+        : is_detached_(is_detached) {}
 
     constexpr bool await_ready() const noexcept {
         return is_detached_;
@@ -66,6 +73,34 @@ struct task_final_awaiter<void>
         return current.promise().parent_coroutine;
     }
     constexpr void await_resume() const noexcept {}
+
+private:
+    bool is_detached_;
+};
+
+// ============================================================
+// frame_pool — per-thread coroutine frame recycling (B2)
+// ============================================================
+// thread_local（函数局部静态，首次 operator new 调用时构造，
+// 线程退出时析构并排空剩余帧）。按尺寸精确匹配复用；帧内存是原始字节，
+// 由新协程的 promise 就地构造，尺寸/对齐匹配即可安全复用。
+// 最多保留 kSlots 帧/线程；满则直接 ::operator delete。
+struct frame_pool {
+    static constexpr std::size_t kSlots = 8;
+    struct slot { void* ptr; std::size_t size; };
+    slot slots[kSlots]{};
+    std::size_t count = 0;
+
+    ~frame_pool() {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (slots[i].ptr) ::operator delete(slots[i].ptr);
+        }
+    }
+
+    static frame_pool& instance() {
+        static thread_local frame_pool p;
+        return p;
+    }
 };
 
 /**
@@ -79,6 +114,45 @@ class task_promise_base
     friend struct task_final_awaiter<T>;
 public:
     task_promise_base() noexcept = default;
+
+    // ---- 协程帧回收池（吸收 asio thread_info_base 设计）----
+    // Frame recycling pool (adopts asio's thread_info_base design).
+    // 短生命周期任务（连接风暴、httpd 短连接、combinator 中间任务）的帧
+    // 频繁 new/delete；per-thread 按尺寸空闲链表复用可减少分配次数与堆碎片。
+    // 长连接场景帧存活期间不入池，无影响。
+    // 注意：MT 下帧可能在线程 A 分配、线程 B 释放（跨线程 co_spawn），
+    // 池是 thread_local 的 —— 释放进 B 的池、分配从当前线程池取，天然安全
+    // （帧内存是原始字节，尺寸匹配即可复用；内容已由运行时析构）。
+    // 过对齐帧走 aligned operator new，不入池（下方 aligned 重载直接转发）。
+    static void* operator new(std::size_t size) {
+        auto& p = detail::frame_pool::instance();
+        for (std::size_t i = 0; i < p.count; ++i) {
+            if (p.slots[i].size == size) {
+                void* mem = p.slots[i].ptr;
+                p.slots[i] = p.slots[--p.count];
+                return mem;
+            }
+        }
+        return ::operator new(size);
+    }
+    static void operator delete(void* ptr, std::size_t size) noexcept {
+        auto& p = detail::frame_pool::instance();
+        if (p.count < detail::frame_pool::kSlots) {
+            p.slots[p.count++] = {ptr, size};
+            return;
+        }
+        ::operator delete(ptr);
+    }
+    static void* operator new(std::size_t size, std::align_val_t al) {
+        return ::operator new(size, al);
+    }
+    static void operator delete(void* ptr, std::align_val_t al) noexcept {
+        ::operator delete(ptr, al);
+    }
+    static void operator delete(void* ptr, std::size_t,
+                                std::align_val_t al) noexcept {
+        ::operator delete(ptr, al);
+    }
 
     // 协程的"启动按钮"
     // Lazy: suspend_always → 等待被 co_await 时才执行
@@ -322,14 +396,14 @@ public:
 
     constexpr void return_void() const noexcept {}
 
-    // P0-2 fix: 移除 final_suspend 中的 is_detached_ 检查。
-    // is_detached_ 在协程帧中可能未正确初始化（MSVC bug），
-    // 导致非 detached 任务被误判为 detached，帧被运行时自动销毁，
-    // 父协程永不恢复（when_all void 路径死锁 10 秒直到 stopper 超时）。
-    // 替代方案：detached 任务在 final_suspend 挂起，
-    // 由 drain_residual_coroutines 或 io_context 析构清理。
+    // P2-1 fix: final_suspend 从 promise 的 is_detached_（成员默认初始化
+    // {false}，无垃圾值）构造 final awaiter，重新启用 detached 帧的运行时
+    // 自动销毁。P0-2 曾因 MSVC 帧内 flag 未初始化误判 detached（when_all
+    // void 路径死锁）而移除检查，代价是 detached 帧在 final_suspend 挂起后
+    // 句柄被 detach() 清空 → 帧永久孤儿化泄漏（C1000K 每连接 +4.4KB）。
+    // 构造函数注入保证确定性初始化，且 final_awaiter 不再有独立默认成员。
     constexpr task_final_awaiter<void> final_suspend() const noexcept {
-        return {};
+        return task_final_awaiter<void>{is_detached_};
     }
 
     // P0-2 fix: 不在 unhandled_exception 中 rethrow（即使 is_detached_ 为 true）。

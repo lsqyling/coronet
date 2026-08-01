@@ -1,9 +1,19 @@
 # coronet Code Review 报告
 
-> 最新更新: 2026-07-27
+> 最新更新: 2026-08-01
 
 ## 目录
 
+- [2026-08-01: C1000K 内存排查 + detached 帧泄漏修复](#2026-08-01-c1000k-内存排查--detached-帧泄漏修复)
+  - [背景与目标](#背景与目标)
+  - [排查过程（四层测试手段，全部数据驱动）](#排查过程四层测试手段全部数据驱动)
+  - [P0: detached 任务帧永久泄漏 — C1000K 内存 3x 差距根因](#p0-detached-任务帧永久泄漏--c1000k-内存-3x-差距根因)
+  - [修复效果（三端实测）](#修复效果三端实测)
+  - [B1: io_uring ring 条目配置化](#b1-io_uring-ring-条目配置化)
+  - [B2: task 帧回收池（吸收 asio thread_info_base 设计）](#b2-task-帧回收池吸收-asio-thread_info_base-设计)
+  - [asio 协程版对比工具链](#asio-协程版对比工具链)
+  - [coronet vs asio 协程设计对比总结](#coronet-vs-asio-协程设计对比总结)
+  - [回归验证（36/36 测试 + 15/15 压测）](#回归验证3636-测试--1515-压测)
 - [2026-07-27: TLS 模块审查](#2026-07-27-tls-模块审查)
   - [TLS 代码审查](#tls-代码审查)
   - [OpenSSL 构建系统方案](#openssl-构建系统方案)
@@ -22,6 +32,184 @@
   - [验证结果总览](#验证结果总览)
 - [关键设计决策回顾](#关键设计决策回顾)
 - [附录：改动统计与文件清单](#附录改动统计与文件清单)
+
+---
+
+## 2026-08-01: C1000K 内存排查 + detached 帧泄漏修复
+
+**起因**: 三端（epoll / io_uring / IOCP）C1000K 压测显示 coronet 内存约为 asio 回调版
+2~3 倍（13-15MB vs 5-8MB），性能持平。目标：数据驱动定位真正瓶颈，与 asio **协程版**
+同编程模型对比（回调版对比不公平），吸收 asio 好的设计。
+
+### 背景与目标
+
+1. 新增 asio 协程版 echo 服务器（ST/MT），与 coronet 服务器逐行镜像结构
+2. 四层测试手段交叉验证，不靠猜测
+3. 依据数据决定是否优化 coronet 核心设计
+
+### 排查过程（四层测试手段，全部数据驱动）
+
+#### 1. LD_PRELOAD malloc 探针（Linux）— 精确分配直方图
+
+拦截 malloc/calloc/realloc/aligned_alloc（含编译器内联的 new→malloc），
+按尺寸统计（size → count, total, live）：
+
+| 服务器 | 每连接帧大小 | 帧数量 | 总分配 |
+|---|---|---|---|
+| coronet epoll ST | 4432B | 2002 | 9.48MB |
+| coronet epoll chain | 4752B（链式状态 +320B） | 2002 | 10.12MB |
+| coronet io_uring ST | 4288B | 2002 | 8.79MB |
+| asio coro ST | 4368B + 每操作 100-370B 堆分配 | 2002 | 11.97MB |
+
+**结论**: 帧大小三端几乎相同（~4.3-4.7KB）；总分配量 coronet（9.5MB）反而 **小于** asio（12MB，
+每操作堆分配 churn 3.1MB）。"每连接设计问题"假设被数据排除。
+
+#### 2. Windows 内联探针 + `_msize` 活块计数 — 抓到泄漏
+
+operator new 覆盖 + 精确活块追踪：coronet 2200 帧压测后 **全部存活**，
+连接关闭后帧永不释放（新连接正常，live 计数 2000 → 2001）。
+
+#### 3. 最小复现实验（Windows）— 排除"堆保留"理论
+
+2200 × 4432B 分配 + 释放 1200 的 C 测试：malloc 与 _aligned_malloc 的 WorkingSet
+释放行为一致（11MB → 7MB，释放生效）—— uCRT 堆行为无差异，差距不是分配器特性。
+
+#### 4. RSS 前后对照（Linux）— 确认泄漏三端一致
+
+500 连接压测中段 RSS 8.7MB，连接关闭后 **不回落** → 会话帧泄漏；
+修复后同样测试回落到基线 4.6MB。
+
+### P0: detached 任务帧永久泄漏 — C1000K 内存 3x 差距根因
+
+**文件**: `include/coronet/task.hpp`
+
+**问题**: `task<void>::detach()` 设置 promise 的 `is_detached_` 后清空句柄，
+协程在 `final_suspend` 挂起。但 **P0-2 修复（2026-07-26，MSVC when_all 死锁）把
+final_suspend 改为总是挂起，且 final awaiter 的 `is_detached_` 是独立默认成员
+（永远 false）—— promise 的 flag 从未被消费**。结果：
+
+- detached 协程在 final_suspend 挂起 → 句柄已被 detach() 清空 → **帧孤儿化，永不销毁**
+- `drain_residual_coroutines` 只排空就绪队列，救不了已挂起的孤儿
+- 每个连接泄漏 ~4.4KB，三端一致 → 1000 连接 2 轮 = 2000 帧 ≈ 8.9MB，
+  **这就是 3x 内存差距的全部来源**（asio 的 awaitable_frame 完成时正确销毁，所以只有 5.5MB）
+
+**修复（P2-1 编号沿用 task 模块既有规则，本次为 detached 帧泄漏）**:
+
+```cpp
+// task_final_awaiter<void>：显式构造函数注入，成员不再有独立默认值
+explicit constexpr task_final_awaiter(bool is_detached) noexcept
+    : is_detached_(is_detached) {}
+
+// task_promise<void>::final_suspend()：从 promise 的 is_detached_
+// （成员默认初始化 {false}，确定性）构造 awaiter
+constexpr task_final_awaiter<void> final_suspend() const noexcept {
+    return task_final_awaiter<void>{is_detached_};
+}
+```
+
+重新启用 C++20 运行时自动销毁路径（`await_ready()==true`，安全：不在 await_suspend
+中手动 destroy，规避 MSVC 运行时访问已毁帧的问题）。解决了 2026-07-26 P0-2 的原始
+顾虑：flag 通过构造函数注入，不再依赖帧内未初始化成员。
+
+### 修复效果（三端实测）
+
+| 指标 | 修复前 | 修复后 | asio coro（参照） |
+|---|---|---|---|
+| epoll coronet_ST 内存 | 13-15MB | **5MB** | 10MB |
+| epoll chain | 14-16MB | **5MB** | - |
+| epoll coronet_MT(6) | 16MB | **6-8MB** | 10MB |
+| io_uring coronet_ST | 15MB | **7-9MB** | 10MB |
+| Windows coronet_ST | 14MB | **5-6MB** | 5-10MB |
+| Windows coronet_MT(6) | 15MB | **6MB** | 5MB |
+| 吞吐（三端） | 40-50k rps | 持平（无回归） | 持平 |
+
+**顺带发现**: `test/ft_task.cpp` 的 detach 测试在 P2-1 后存在遗留双重释放
+（手动 destroy 已自动销毁的帧）—— B2 帧池的析构排空将其暴露，已修复。
+
+### B1: io_uring ring 条目配置化
+
+**文件**: `include/coronet/config/io_context.hpp`
+
+**问题**: `entries = bit_ceil(2 × swap_capacity) = 32768`，每个 worker ring ≈ 4.7MB
+（SQE 128B + CQE 16B + 内核侧）；6 worker 的 MT 场景仅 ring 就 ~28MB ——
+io_uring MT 35MB 报告的主要来源（纯配置项，非代码问题）。
+
+**修复**: `default_io_uring_entries = 4096`（2^12）。C1000K 场景 1000 连接 × 1 在飞
+op ≈ 1000 SQE，4096 富余无溢出风险；同时用作 epoll max_events（4096 事件/批足够）。
+
+**验证**: io_uring MT(6) 1000 连接中段 RSS **35MB → 11.8MB**，压测后回落基线；
+完整压测 coronet_MT **12MB**（原 27-35MB），吞吐不变。
+
+### B2: task 帧回收池（吸收 asio thread_info_base 设计）
+
+**文件**: `include/coronet/task.hpp` — `detail::frame_pool` + `task_promise_base`
+的 operator new/delete
+
+**设计**: per-thread（函数局部 thread_local，线程退出自动排空）按尺寸精确匹配的
+8 槽空闲链表。短生命周期任务（连接风暴、combinator 中间任务）复用帧，减少
+分配/释放频率与堆碎片。
+
+**要点**:
+- 帧内存是原始字节，内容已由运行时析构，尺寸匹配即可安全复用
+- 过对齐帧走 aligned operator new，不入池
+- MT 安全：帧可能在线程 A 分配、线程 B 释放（跨线程 co_spawn）—— thread_local 池天然安全
+- 与 P2-1 自动销毁路径配合：delete 时入池
+
+### asio 协程版对比工具链
+
+**新增**（`stress-test/`，供后续对比与回归）:
+
+| 文件 | 内容 |
+|---|---|
+| `redis_echo_asio_coro_ST.cpp` / `_MT.cpp` | asio co_spawn + use_awaitable 服务器，镜像 coronet 服务器结构（4096B 缓冲在协程帧内）；MT = 1 io_context + N 线程 |
+| `stress-test/CMakeLists.txt` | 新目标复用 asio INTERFACE target；显式 cxx_std_20（asio INTERFACE 不传播） |
+| `script/linux/bench_c1000k.sh` / `script/win/bench_c1000k.ps1` | 测试 5 项：coronet_ST / **coronet_chain**（链式对比）/ ASIO_coro_ST / coronet_MT / ASIO_coro_MT |
+
+### coronet vs asio 协程设计对比总结
+
+| 维度 | coronet | asio | 结论 |
+|---|---|---|---|
+| 帧大小 | 4288-4752B | 4368B | 相当 |
+| 每操作分配 | **零**（ctx 嵌入帧、task_info 在 promise、IOCP 回收池） | 100-370B/次（总分配 12MB > coronet 9.5MB） | **coronet 优** |
+| 帧生命周期 | 修复前泄漏 / 修复后自动销毁 | 自动销毁 | 修复后对齐 |
+| 帧回收池 | 修复前无 / B2 后 thread_local 池 | thread_local 池 | 已吸收 |
+| 调度 | 对称转移（final 返回父句柄），无 wrapper 帧 | awaitable_thread 帧栈泵 + entry_point wrapper 帧 | 相当/coronet 更省 |
+
+**结论**: coronet 设计本身与 asio 相当或更优。3x 内存差距 100% 来自 detached 帧泄漏
+（已修复），无需重构核心设计。
+
+### 回归验证（36/36 测试 + 15/15 压测）
+
+**测试集**（epoll / io_uring / IOCP 三端，各 12 项）:
+task_gtest 21 / generator_gtest 3 / channel_gtest 3 / shared_task_gtest 8 /
+ft_task / coro_lifetime / generator_test / move_shared_task /
+channel_stress / **combinator_stress（when_all void 路径，即 07-26 P0-2 原始死锁场景）** /
+lazy_io_comprehensive / async_io_iso_stress —— 全部 PASS
+
+**c1000k 压测**（修复 + B1 + B2 后最终数据，rps / 内存）:
+
+| 服务端 | epoll | io_uring | Windows |
+|---|---|---|---|
+| coronet_ST | 46464 / 8MB | 45556 / 9MB | 43286 / 6MB |
+| coronet_chain | 49640 / 9MB | 46045 / 9MB | 42930 / 6MB |
+| ASIO_coro_ST | 48237 / 9MB | 44383 / 9MB | 43055 / 7MB |
+| coronet_MT(6) | 33770 / 6MB | 34709 / 12MB | 45575 / 6MB |
+| ASIO_coro_MT(6) | 38734 / 10MB | 38159 / 10MB | 24906 / 6MB |
+
+**MT 缩放补充验证（多进程客户端）**: 3 × redis-benchmark 并发（各 -c 300）压
+coronet_MT，聚合 **67.3k rps** vs 单客户端 37.8k = **1.78x 扩展** —— coronet MT
+缩放正常，此前"MT 退化"是单进程 redis-benchmark 客户端瓶颈，非库问题。
+Windows MT coronet 45575 比 asio 24906 高 **83%**。
+
+**提交记录**（build/3-ways 分支）:
+
+| Commit | 内容 |
+|---|---|
+| `4b8edbd` | fix: detached task frames leak forever (P2-1) |
+| `49b41e5` | stress-test: asio coroutine echo servers + c1000k chain/coro comparison |
+| `7d74b5b` | config: io_uring ring entries 32768 -> 4096 (B1) |
+| `2e3e865` | task: per-thread coroutine frame recycling pool (B2) |
+| `f5b07cf` | test: ft_task detach test — remove double destroy after P2-1 |
 
 ---
 
@@ -1192,6 +1380,7 @@ epoll 无法做内核原生异步文件 I/O（不像 io_uring 的 `IORING_OP_REA
 | **合计（已修复）** | | **42 项** | **19 文件** |
 | 2026-07-26 全面审查 | P0/P1/P2/P3 | 12 项 | 待修复 |
 | 2026-07-27 TLS 审查 | P1/P2/P3 | 6 项 | 待修复 |
+| 2026-08-01 C1000K 排查 | P0（detached 帧泄漏）+ B1/B2 + 测试修复 | 4 项 | 5 文件 |
 
 ### 全部修改文件清单
 
@@ -1222,3 +1411,9 @@ epoll 无法做内核原生异步文件 I/O（不像 io_uring 的 `IORING_OP_REA
 | `include/coronet/net/tls/tls_socket.hpp` | TLS 套接字（新增） |
 | `include/coronet/net/tls/tls_acceptor.hpp` | TLS 监听器（新增） |
 | `cmake/Extra.cmake` | OpenSSL FetchContent fallback |
+| `include/coronet/task.hpp` | P2-1 detached 帧泄漏修复（final awaiter 构造函数注入）+ B2 帧回收池（frame_pool + operator new/delete） |
+| `include/coronet/config/io_context.hpp` | B1 io_uring entries 32768 → 4096（MT 内存 27→12MB） |
+| `test/ft_task.cpp` | P2-1 后 detach 测试移除双重释放 |
+| `stress-test/redis_echo_asio_coro_ST.cpp` / `_MT.cpp` | asio 协程版 echo 服务器（新增，同模型对比） |
+| `stress-test/CMakeLists.txt` | asio 协程版目标（cxx_std_20 + WIN32 链接） |
+| `script/linux/bench_c1000k.sh` / `script/win/bench_c1000k.ps1` | chain + asio coro 对比配置 |

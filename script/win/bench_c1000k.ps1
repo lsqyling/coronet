@@ -55,8 +55,8 @@ $BinaryNames = @{
     "coronet_ST"       = "redis_echo_ST.exe"
     "coronet_chain"    = "redis_echo_chain.exe"
     "coronet_MT"       = "redis_echo_MT.exe"
-    "ASIO_ST"          = "redis_echo_asio_ST.exe"
-    "ASIO_MT"          = "redis_echo_asio_MT.exe"
+    "ASIO_coro_ST"     = "redis_echo_asio_coro_ST.exe"
+    "ASIO_coro_MT"     = "redis_echo_asio_coro_MT.exe"
 }
 
 $RedisDir    = Join-Path $RepoRoot "redistools"
@@ -118,6 +118,7 @@ function Invoke-FullCleanup {
     $orphanNames = @(
         "redis_echo_ST", "redis_echo_chain", "redis_echo_MT",
         "redis_echo_asio_ST", "redis_echo_asio_MT",
+        "redis_echo_asio_coro_ST", "redis_echo_asio_coro_MT",
         "redis-benchmark", "redis_loadgen", "stress_driver"
     )
     foreach ($name in $orphanNames) {
@@ -339,14 +340,14 @@ try {
 
     $r1a = Test-Server "coronet_ST"       (Join-Path $BinDir $BinaryNames["coronet_ST"])    ($PortBase)
     $r1b = Test-Server "coronet_chain"    (Join-Path $BinDir $BinaryNames["coronet_chain"]) ($PortBase + 1)
-    $r1c = Test-Server "ASIO_ST"          (Join-Path $BinDir $BinaryNames["ASIO_ST"])       ($PortBase + 2)
+    $r1c = Test-Server "ASIO_coro_ST"     (Join-Path $BinDir $BinaryNames["ASIO_coro_ST"])  ($PortBase + 2)
 
     # ---- Round 2: Multi-Threaded ----
     Write-Host "`n=== Round 2: Multi-Threaded (6 threads) ===" -ForegroundColor Cyan
     Add-Content -Path $ReportFile -Value "`n=== Round 2: Multi-Threaded (6 threads) ==="
 
     $r2a = Test-Server "coronet_MT(6)"    (Join-Path $BinDir $BinaryNames["coronet_MT"])    ($PortBase + 10) "6"
-    $r2b = Test-Server "ASIO_MT(6)"       (Join-Path $BinDir $BinaryNames["ASIO_MT"])       ($PortBase + 11) "6"
+    $r2b = Test-Server "ASIO_coro_MT(6)"  (Join-Path $BinDir $BinaryNames["ASIO_coro_MT"])  ($PortBase + 11) "6"
 
     # ---- Compute stats ----
     $totalTime = [math]::Round(((Get-Date) - $StartTime).TotalMinutes, 1)
@@ -379,13 +380,13 @@ try {
   Single-Threaded:
     coronet_ST:     RPS=$([math]::Round($r1a.rps,0))  CPU=$($r1a.cpu)%  MEM=$($r1a.mem)MB
     coronet_chain:  RPS=$([math]::Round($r1b.rps,0))  CPU=$($r1b.cpu)%  MEM=$($r1b.mem)MB
-    ASIO_ST:        RPS=$([math]::Round($r1c.rps,0))  CPU=$($r1c.cpu)%  MEM=$($r1c.mem)MB
-    coronet_ST vs ASIO: ${stVsAsio}%
+    ASIO_coro_ST:   RPS=$([math]::Round($r1c.rps,0))  CPU=$($r1c.cpu)%  MEM=$($r1c.mem)MB
+    coronet_ST vs ASIO_coro: ${stVsAsio}%
 
   Multi-Threaded (6 threads):
     coronet_MT(6):  RPS=$([math]::Round($r2a.rps,0))  CPU=$($r2a.cpu)%  MEM=$($r2a.mem)MB
-    ASIO_MT(6):     RPS=$([math]::Round($r2b.rps,0))  CPU=$($r2b.cpu)%  MEM=$($r2b.mem)MB
-    coronet_MT vs ASIO: ${mtVsAsio}%
+    ASIO_coro_MT(6): RPS=$([math]::Round($r2b.rps,0))  CPU=$($r2b.cpu)%  MEM=$($r2b.mem)MB
+    coronet_MT vs ASIO_coro: ${mtVsAsio}%
 
   Ports used: $($UsedPorts -join ', ')
 
