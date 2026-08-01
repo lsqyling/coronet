@@ -8,7 +8,8 @@ if(WIN32)
     target_link_libraries(coronet PUBLIC
         ws2_32
         kernel32
-        mswsock)
+        mswsock
+        winmm)  # timeBeginPeriod — 定时器精度 15.625ms → 1ms
 
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "OHOS")
     # Linux / HarmonyOS: both use the Linux kernel, so epoll / eventfd / timerfd

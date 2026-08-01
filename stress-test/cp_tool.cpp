@@ -109,7 +109,11 @@ using namespace std::chrono_literals;
 // ============================================================
 // Default paths
 // ============================================================
-static std::string DEFAULT_SRC = "D:/dev/workspace/yidaoyun/coronet-win/data/windows_10_professional_x64_2026.iso";
+#ifdef _WIN32
+static std::string DEFAULT_SRC = "D:/dev/Downloads/windows_10_professional_x64_2026.iso";
+#else
+static std::string DEFAULT_SRC = "/mnt/d/dev/Downloads/windows_10_professional_x64_2026.iso";
+#endif
 static std::string g_src_path;
 static std::string g_dst_path;
 static size_t g_chunk_size = 4 * 1024 * 1024;  // 4MB default

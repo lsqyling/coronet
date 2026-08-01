@@ -78,8 +78,17 @@ endforeach()
 #   ctest --test-dir build -R cp_tool -V
 #
 # 不传参数时使用 cp_tool 内置默认值（源码 DEFAULT_SRC / get_default_desktop）
-set(CP_TOOL_SRC "/home/shiqing/workspace/Downloads/windows_10_professional_x64_2026.iso" CACHE STRING "cp_tool: source file path")
-set(CP_TOOL_DST "/mnt/c/Users/10580/AppData/windows_10_professional_x64_2026.iso" CACHE STRING "cp_tool: destination file path")
+# ISO 测试文件路径按平台区分（自动化硬编码默认值，可 cmake -D 覆盖）:
+#   Windows: D:/dev/Downloads/...    Linux (WSL): /mnt/d/dev/Downloads/...
+if(WIN32)
+    set(CP_TOOL_DEFAULT_SRC "D:/dev/Downloads/windows_10_professional_x64_2026.iso")
+    set(CP_TOOL_DEFAULT_DST "C:/Users/10580/AppData/windows_10_professional_x64_2026.iso")
+else()
+    set(CP_TOOL_DEFAULT_SRC "/mnt/d/dev/Downloads/windows_10_professional_x64_2026.iso")
+    set(CP_TOOL_DEFAULT_DST "/mnt/c/Users/10580/AppData/windows_10_professional_x64_2026.iso")
+endif()
+set(CP_TOOL_SRC "${CP_TOOL_DEFAULT_SRC}" CACHE STRING "cp_tool: source file path")
+set(CP_TOOL_DST "${CP_TOOL_DEFAULT_DST}" CACHE STRING "cp_tool: destination file path")
 set(CP_TOOL_CHUNK_MB "4" CACHE STRING "cp_tool: chunk size in MB (default: 4)")
 set(CP_TOOL_NO_VERIFY OFF CACHE BOOL "cp_tool: skip verification after copy")
 set(CP_TOOL_TIMEOUT_SEC "600" CACHE STRING "cp_tool: timeout in seconds (default: 600)")
