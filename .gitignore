@@ -29,6 +29,9 @@ build*/
 *.a
 *.dylib
 
+# redistools/ 下的 Windows 工具二进制刻意入库（供 Windows 平台开箱使用）
+!redistools/*.exe
+
 
 # CMake
 CMakeUserPresets.json
