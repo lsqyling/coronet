@@ -67,7 +67,14 @@ namespace {
 struct op_free_list {
     iocp_operation* head = nullptr;
     int count = 0;
-    static constexpr int max_count = 128;
+    // 池上限 128 → 4096（C1000k 内存优化）：
+    // 1000 并发压测下 in-flight operations 峰值 ~2000+（每连接 recv+send 各 1），
+    // 旧上限 128 导致池恒满、每次 I/O 都 new/delete 一个 64B 对象
+    // （650k req ≈ 1.3M 次堆分配）。高频小分配 + 5KB 协程帧的分配/释放交错，
+    // 使 LFH 堆的 64KB subsegment 碎片化并永久占用 → 压测后 WS 膨胀至 ASIO 的 3 倍
+    // （!heap -l 证实无泄漏，活跃块仅 480 个 0MB，是段不收缩）。
+    // 4096 × 64B ≈ 256KB/线程 常驻，换取压测中零堆分配。
+    static constexpr int max_count = 4096;
 };
 
 thread_local op_free_list tl_ops;
