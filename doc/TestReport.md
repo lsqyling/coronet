@@ -1,6 +1,6 @@
 # coronet 测试报告
 
-> 最新更新: 2026-07-30
+> 最新更新: 2026-08-02
 
 ## 目录
 
@@ -198,7 +198,71 @@
 
 ## 二、性能基准
 
-### C1000K 压测结果
+### C1000K 压测最终报告（2026-08-02，P2-1 + B1 + B2 修复后）
+
+> Date: 2026-08-02 | 三端同日实跑：epoll / io_uring / Windows (IOCP)
+> 配置: 1,000,000 req × 1,000 concurrent | PING_INLINE (no pipelining)
+> 报告: `buildepoll|builduring|buildmsvc/data/bench_report_20260802_*.txt`
+
+#### 三端对比总表（rps / 内存）
+
+| 服务端 | epoll | io_uring | Windows (IOCP) |
+|---|---|---|---|
+| **coronet_ST** | 47099 / 8MB | **53743** / 9MB | 47950 / 6MB |
+| **coronet_chain** | 45473 / 9MB | **55145** / 9MB | 47277 / 5MB |
+| ASIO_coro_ST（参照） | 45253 / 10MB | 49603 / 10MB | 47210 / 5MB |
+| **coronet_MT(6)** | 31787 / 6MB | 33759 / 12MB | **46999** / 6MB |
+| ASIO_coro_MT(6) | 36759 / 10MB | 41085 / 10MB | 27249 / 6MB |
+
+#### 单线程对比（coronet vs asio 协程版）
+
+| 端 | coronet_ST | ASIO_coro_ST | 差值 |
+|---|---|---|---|
+| epoll | 47099 | 45253 | **+4.1%** |
+| io_uring | 53743 | 49603 | **+8.3%** |
+| Windows | 47950 | 47210 | **+1.6%** |
+
+io_uring 单线程 53.7k rps 为三端全场最佳；coronet_chain io_uring 55.1k 更高 ——
+对称转移调度（final 返回父句柄、零 wrapper 帧）在链式场景无额外开销。
+
+#### 多线程对比（6 threads）
+
+| 端 | coronet_MT rps / CPU% | ASIO_coro_MT rps / CPU% | 每 CPU% 效率 |
+|---|---|---|---|
+| epoll | 31787 / 70% | 36759 / 110% | coronet 高 ~35% |
+| io_uring | 33759 / 50% | 41085 / 110% | coronet 高 ~70% |
+| Windows | 46999 / 26.7% | 27249 / 69.6% | coronet 高 **4.5×** |
+
+- asio MT 靠多核堆 CPU（110% / 69.6%）换取吞吐（线程池 spin/分发开销），
+  coronet 对称转移调度单核效率远高
+- Linux MT 名义差距另有实证：3 × redis-benchmark 并发聚合 **67.3k rps** =
+  单客户端 37.8k 的 **1.78× 扩展** —— MT 机制正常，单进程 redis-benchmark 客户端为瓶颈
+- Windows MT coronet 比 asio 高 **72.5%**
+
+#### 内存对比（修复后 vs 修复前）
+
+| 端 | coronet_ST | coronet_MT(6) | asio 参照 |
+|---|---|---|---|
+| epoll | 8MB（前 13-15MB） | 6MB（前 16MB） | 10MB |
+| io_uring | 9MB（前 15MB） | 12MB（前 35MB，ring 预分配） | 10MB |
+| Windows | 6MB（前 14MB） | 6MB（前 15MB） | 5-7MB |
+
+3× 内存差距 100% 来自 detached 帧泄漏（P2-1，修复见 CodeReview.md），修复后与
+asio 同级；io_uring MT 12MB 为 ring 缓冲（B1 后 4096 条目，富余无风险）。
+
+#### 最终结论
+
+1. **性能**: ST 三端全部领先 asio 协程版（+1.6% ~ +8.3%）；MT Windows +72.5%、
+   Linux 单核效率高 35-70% —— 吞吐目标达成，无库级瓶颈
+2. **内存**: 与 asio 同级（5-12MB），3× 差距归零
+3. **分配模型**: 每操作**零堆分配**（ctx 嵌入帧 + task_info 在 promise）优于 asio
+   每操作 100-370B churn；帧回收池（B2）已吸收 asio 设计
+4. **工程结论**: 无需重构核心设计；coronet 为三端一致的现代 C++20 协程库，
+   性能同级或更优、内存同级、单核效率更高
+
+---
+
+### C1000K 压测结果（2026-07-24，历史数据）
 
 > Date: 2026-07-24 | Platform: Windows 11 + MSVC 2022 Release build (native)
 > Tool: redis-benchmark (Windows x64 3.0.504) | Command: PING_INLINE (no pipelining)
