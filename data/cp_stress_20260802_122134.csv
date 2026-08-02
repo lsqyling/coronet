@@ -1,0 +1,2 @@
+Source,Destination,Size_GB,Chunk_MB,Copy_ms,Copy_MBps,Verify_ms,Verify_OK,Chunks_Copied,Chunks_Verified,CPU_pct,Avg_Mem_MB,Peak_Mem_MB
+D:\dev\Downloads\windows_10_professional_x64_2026.iso,C:\Users\10580\AppData\cp_speed_test.iso,4.24142,4,6134,708.057,13994,YES,1086,1086,70.0912,14,15

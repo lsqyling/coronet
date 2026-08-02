@@ -1,0 +1,2 @@
+Source,Destination,Size_GB,Chunk_MB,Copy_ms,Copy_MBps,Verify_ms,Verify_OK,Chunks_Copied,Chunks_Verified,CPU_pct,Avg_Mem_MB,Peak_Mem_MB
+/home/shiqing/bench/src1g.bin,/home/shiqing/bench/ab_coro_41.bin,1,4,2213,462.72,2900,YES,256,256,91.7595,12,12

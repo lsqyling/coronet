@@ -1,0 +1,2 @@
+Source,Destination,Size_GB,Chunk_MB,Copy_ms,Copy_MBps,Verify_ms,Verify_OK,Chunks_Copied,Chunks_Verified,CPU_pct,Avg_Mem_MB,Peak_Mem_MB
+/mnt/d/dev/Downloads/windows_10_professional_x64_2026.iso,/mnt/c/Users/10580/AppData/ab_ur1.bin,4.24142,4,60105,72.2605,0,YES,1086,0,3.6317,11,12

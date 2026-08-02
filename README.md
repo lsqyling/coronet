@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Windows-MSVC%2019.41-blue" alt="Windows">
   <img src="https://img.shields.io/badge/I/O-epoll%20%7C%20io__uring%20%7C%20IOCP-orange" alt="IO">
   <img src="https://img.shields.io/badge/TLS-OpenSSL%203.4-green" alt="TLS">
-  <img src="https://img.shields.io/badge/test-31%2F31%20passed-success" alt="Tests">
+  <img src="https://img.shields.io/badge/test-36%2F36%20passed-success" alt="Tests">
 </p>
 
 ---
@@ -24,6 +24,11 @@
 | 🔗 | **链式 co_await** | `co_await (recv && send)` 单次挂起完成两个 I/O 操作 |
 | 🧵 | **协程同步原语** | mutex / condition_variable / semaphore / channel / when_all·any·some |
 | 📊 | **统一压测驱动** | `stress_driver --server name:binary:port` 自动采集 RPS + CPU + 内存 |
+
+<p align="center">
+  <a href="doc/ArchitectureDesign.md"><b>📐 架构设计 →</b></a>
+  &nbsp;协程控制流优化 · 并发安全 · 内存安全 · Modern C++ 工程实践
+</p>
 
 ## 🚀 性能速览
 
@@ -43,22 +48,25 @@
 | GCC 13.3 (Linux) | 48,662 | io_uring |
 | Clang 18.1 (Linux) | 47,304 | io_uring |
 
-**C1000K 压测 — 1,000,000 请求 × 1,000 并发, Windows 11 + MSVC 19.41 (IOCP)**
+**C1000K 压测（最终版）— 1,000,000 请求 × 1,000 并发, 三端同日实测 (2026-08-02)**
 
-| 服务端（单线程） | RPS | CPU% | 内存 | 状态 |
-|--------|-----:|:---:|-----:|:---:|
-| coronet ST (协程) | **50,955** | 28.4% | 5 MB | ✅ |
-| coronet chain (链式) | 50,375 | 30.7% | 5 MB | ✅ |
-| ASIO ST (回调) | 46,705 | 40.8% | 5 MB | ✅ |
-| **coronet vs ASIO** | **+9%** | **低 30%** | 持平 | — |
+| 服务端（单线程） | epoll | io_uring | Windows (IOCP) |
+|--------|-----:|-----:|-----:|
+| coronet ST (协程) | 47,099 / 8MB | **53,743** / 9MB | 47,950 / 6MB |
+| coronet chain (链式) | 45,473 / 9MB | **55,145** / 9MB | 47,277 / 5MB |
+| ASIO coro ST (协程) | 45,253 / 10MB | 49,603 / 10MB | 47,210 / 5MB |
 
-| 服务端（6 线程） | RPS | CPU% | 内存 | 状态 |
-|--------|-----:|:---:|-----:|:---:|
-| coronet MT (6) | **50,140** | 31.0% | 6 MB | ✅ |
-| ASIO MT (6) | 30,071 | 80.4% | 6 MB | ✅ |
-| **coronet vs ASIO** | **+67%** | **低 61%** | 持平 | — |
+| 服务端（6 线程） | epoll | io_uring | Windows (IOCP) |
+|--------|-----:|-----:|-----:|
+| coronet MT (6) | 31,787 / 6MB | 33,759 / 12MB | **46,999** / 6MB |
+| ASIO coro MT (6) | 36,759 / 10MB | 41,085 / 10MB | 27,249 / 6MB |
 
-> 📖 详细文档 → [CodeReview 报告](doc/CodeReview.md) | [测试报告](doc/TestReport.md) | [API 手册](doc/ApiManual.md)
+> 数值格式: RPS / 内存。单线程 coronet 三端全部领先 ASIO 协程版（**+1.6% ~ +8.3%**，
+> io_uring 53.7k 为全场最佳）；多线程 Windows **+72.5%**。单核效率: Linux MT 高 35-70%、
+> Windows MT 高 **4.5×**（ASIO 靠多核堆 CPU — 110% / 69.6%）。
+> 内存经 detached 帧泄漏修复（P2-1）后与 ASIO 同级（5-12MB，修复前 3× 差距归零）。
+
+> 📖 详细文档 → [架构设计](doc/ArchitectureDesign.md) | [CodeReview 报告](doc/CodeReview.md) | [测试报告](doc/TestReport.md) | [API 手册](doc/ApiManual.md)
 
 ---
 
@@ -674,10 +682,12 @@ ctest -R stress_driver  # 压测 (ST / MT)
 
 | 平台 / 编译器 | 后端 | 测试数 | 结果 |
 |:---|:---|:---:|:---:|
-| Linux GCC 13.3 | epoll | 27/27 | ✅ |
-| Linux Clang 18.1 | epoll | 27/27 | ✅ |
-| Linux GCC 13.3 | io_uring | 27/27 | ✅ |
-| Windows MSVC 19.41 | IOCP | 27/27 | ✅ |
+| Linux GCC 13.3 | epoll | 36/36 | ✅ |
+| Linux GCC 13.3 | io_uring | 36/36 | ✅ |
+| Windows MSVC 19.41 | IOCP | 35/35 | ✅ |
+
+> Windows 的 cp_tool_asio 偶发受环境内存字节翻转影响（固定损坏点，非代码 bug，
+> 详见 TestReport.md）；`stress_test`（POSIX socket）仅 Linux 编译。
 
 ---
 
@@ -712,7 +722,7 @@ bash script/linux/bench_c1000k.sh
 pwsh script/win/bench_c1000k.ps1
 ```
 
-> 完整 C1000K 结果与结论 → [doc/BENCHMARK_REPORT.md](doc/BENCHMARK_REPORT.md)
+> 完整 C1000K 结果与结论 → [doc/TestReport.md §C1000K 压测最终报告](doc/TestReport.md)
 
 ---
 

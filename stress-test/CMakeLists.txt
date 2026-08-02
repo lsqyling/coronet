@@ -56,24 +56,11 @@ add_executable(redis_echo_MT     redis_echo_MT.cpp)
 target_link_libraries(redis_echo_MT     PRIVATE coronet::coronet)
 
 if(CORONET_HAS_ASIO)
-    add_executable(redis_echo_asio_ST redis_echo_asio_ST.cpp)
-    target_link_libraries(redis_echo_asio_ST PRIVATE asio)
-    if(WIN32)
-        target_compile_definitions(redis_echo_asio_ST PRIVATE _WIN32_WINNT=0x0A00)
-        target_link_libraries(redis_echo_asio_ST PRIVATE ws2_32 mswsock)
-    endif()
-    add_executable(redis_echo_asio_MT redis_echo_asio_MT.cpp)
-    target_link_libraries(redis_echo_asio_MT PRIVATE asio)
-    if(WIN32)
-        target_compile_definitions(redis_echo_asio_MT PRIVATE _WIN32_WINNT=0x0A00)
-        target_link_libraries(redis_echo_asio_MT PRIVATE ws2_32 mswsock)
-    else()
-        find_package(Threads REQUIRED)
-        target_link_libraries(redis_echo_asio_MT PRIVATE Threads::Threads)
-    endif()
     # 协程版（C1000K 同编程模型对比）— mirrors redis_echo_ST/MT.cpp structure:
     # per-connection coroutine frame with 4096B buffer, apples-to-apples with coronet.
     # asio INTERFACE target 不传播 C++20 特性，需显式开启（协程依赖 __cpp_coroutines）。
+    # 回调版源文件（redis_echo_asio_ST/MT.cpp）保留在树内但不编译（对比基线，
+    # 不再需要时可直接删除）。
     add_executable(redis_echo_asio_coro_ST redis_echo_asio_coro_ST.cpp)
     target_compile_features(redis_echo_asio_coro_ST PRIVATE cxx_std_20)
     target_link_libraries(redis_echo_asio_coro_ST PRIVATE asio)
@@ -90,6 +77,33 @@ if(CORONET_HAS_ASIO)
     else()
         find_package(Threads REQUIRED)
         target_link_libraries(redis_echo_asio_coro_MT PRIVATE Threads::Threads)
+    endif()
+
+    # cp_tool_asio — asio 协程版文件拷贝（保留仓库 + 进 ctest）
+    # 后端：Windows = asio 默认 IOCP；Linux = 统一 asio io_uring 后端。
+    # （random_access_file 仅随 IOCP/io_uring 定义（config.hpp: ASIO_HAS_FILE），
+    #  epoll 无文件 I/O —— Linux 上该目标必须启用 io_uring 并链接系统 liburing，
+    #  与 coronet 后端选择（CORONET_IOURING）无关）
+    add_executable(cp_tool_asio cp_tool_asio.cpp)
+    target_compile_features(cp_tool_asio PRIVATE cxx_std_20)
+    target_link_libraries(cp_tool_asio PRIVATE asio)
+    if(WIN32)
+        # Windows：asio 默认后端为 IOCP，文件 I/O 走 random_access_file + IOCP。
+        # 不得定义 ASIO_HAS_IO_URING —— 该宏会引入 io_uring_service.hpp，需要
+        # liburing.h（Linux 才有），Windows 编译会 C1083。
+        target_compile_definitions(cp_tool_asio PRIVATE _WIN32_WINNT=0x0A00)
+        target_compile_options(cp_tool_asio PRIVATE /utf-8)  # C4819: UTF-8 中文注释
+        target_link_libraries(cp_tool_asio PRIVATE ws2_32 mswsock)
+    else()
+        # Linux：统一启用 ASIO_HAS_IO_URING —— opt-in 宏（config.hpp 不自动定义），
+        # 文件 I/O 走 asio io_uring 后端（系统 liburing C 库，非 liburingcxx
+        # header-only）；socket 仍走 epoll 默认后端（ASIO_HAS_IO_URING_AS_DEFAULT
+        # 在 epoll 存在时不成立），与 coronet io_uring 后端同机制对照。
+        target_compile_definitions(cp_tool_asio PRIVATE ASIO_HAS_IO_URING)
+        find_package(Threads REQUIRED)
+        target_link_libraries(cp_tool_asio PRIVATE Threads::Threads)
+        find_library(LIBURING_LIB uring REQUIRED)
+        target_link_libraries(cp_tool_asio PRIVATE ${LIBURING_LIB})
     endif()
 endif()
 
@@ -177,6 +191,26 @@ coronet_add_test(cp_tool COMMAND $<TARGET_FILE:cp_tool> ${cp_tool_args})
 # cp_tool tests copy a 5GB ISO — needs extended timeout
 set_tests_properties(cp_tool PROPERTIES TIMEOUT 1200)
 
+# cp_tool_asio — asio 协程版对照（保留仓库 + 进 ctest）
+# 与 cp_tool 相同参数，dst 追加 .asio 后缀避免两个测试互相覆盖文件
+if(CORONET_HAS_ASIO)
+    set(cp_tool_asio_args "")
+    if(CP_TOOL_SRC)
+        list(APPEND cp_tool_asio_args "${CP_TOOL_SRC}")
+    endif()
+    if(CP_TOOL_DST)
+        list(APPEND cp_tool_asio_args "${CP_TOOL_DST}.asio")
+    endif()
+    list(APPEND cp_tool_asio_args "--chunk" "${CP_TOOL_CHUNK_MB}")
+    if(CP_TOOL_NO_VERIFY)
+        list(APPEND cp_tool_asio_args "--no-verify")
+    endif()
+    list(APPEND cp_tool_asio_args "--timeout" "${CP_TOOL_TIMEOUT_SEC}")
+
+    coronet_add_test(cp_tool_asio COMMAND $<TARGET_FILE:cp_tool_asio> ${cp_tool_asio_args})
+    set_tests_properties(cp_tool_asio PROPERTIES TIMEOUT 1200)
+endif()
+
 # ============================================================
 # CTest — 通过 --server name:binary:port 配置，添加新服务端只改这里
 # ============================================================
@@ -187,7 +221,7 @@ coronet_add_test(stress_driver_ST COMMAND $<TARGET_FILE:stress_driver>
     --server "coronet_ST:redis_echo_ST:17080"
     --server "coronet_chain:redis_echo_chain:17081"
     $<$<BOOL:${CORONET_HAS_ASIO}>:--server>
-    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_ST:redis_echo_asio_ST:17082">
+    $<$<BOOL:${CORONET_HAS_ASIO}>:ASIO_coro_ST:redis_echo_asio_coro_ST:17082>
     -n 10000 -c 50)
 set_tests_properties(stress_driver_ST PROPERTIES TIMEOUT 60)
 
@@ -196,6 +230,6 @@ set_tests_properties(stress_driver_ST PROPERTIES TIMEOUT 60)
 coronet_add_test(stress_driver_MT COMMAND $<TARGET_FILE:stress_driver>
     --server "coronet_MT(6):redis_echo_MT:17090"
     $<$<BOOL:${CORONET_HAS_ASIO}>:--server>
-    $<$<BOOL:${CORONET_HAS_ASIO}>:"ASIO_MT\(6\):redis_echo_asio_MT:17091">
+    $<$<BOOL:${CORONET_HAS_ASIO}>:ASIO_coro_MT\(6\):redis_echo_asio_coro_MT:17091>
     -n 10000 -c 50)
 set_tests_properties(stress_driver_MT PROPERTIES TIMEOUT 120)

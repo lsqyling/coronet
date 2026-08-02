@@ -61,11 +61,15 @@ def kill_processes(dry_run=False):
             except Exception:
                 pass
     else:
-        # Linux/macOS: pkill
+        # Linux/macOS: pkill -x（精确进程名匹配，不用 -f 全命令行匹配）
+        # -f 会匹配到父进程树自身（如 ctest 的 -R "stress_driver_ST" 参数、
+        # 用户 shell 脚本的命令行含服务名），pkill 向自己的祖先发 SIGTERM
+        # 会导致整条命令链挂死（ctest 优雅关停等待子进程 → 死锁）。
+        # 服务器进程名恰好等于 STRESS_PROCESSES 列表项，-x 精确匹配足够。
         for proc in STRESS_PROCESSES:
             try:
                 result = subprocess.run(
-                    ["pkill", "-f", proc],
+                    ["pkill", "-x", proc],
                     capture_output=True, text=True, timeout=5
                 )
                 if result.returncode == 0:

@@ -1,0 +1,2 @@
+Source,Destination,Size_GB,Chunk_MB,Copy_ms,Copy_MBps,Verify_ms,Verify_OK,Chunks_Copied,Chunks_Verified,CPU_pct,Avg_Mem_MB,Peak_Mem_MB
+/mnt/d/dev/Downloads/cp_ab_src1g.bin,/mnt/c/Users/10580/AppData/ab_coro1.bin,1,4,9127,112.195,11394,YES,256,256,18.7248,12,12
