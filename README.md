@@ -25,6 +25,11 @@
 | 🧵 | **协程同步原语** | mutex / condition_variable / semaphore / channel / when_all·any·some |
 | 📊 | **统一压测驱动** | `stress_driver --server name:binary:port` 自动采集 RPS + CPU + 内存 |
 
+<p align="center">
+  <a href="doc/ArchitectureDesign.md"><b>📐 架构设计 →</b></a>
+  &nbsp;协程控制流优化 · 并发安全 · 内存安全 · Modern C++ 工程实践
+</p>
+
 ## 🚀 性能速览
 
 **Redis PING 服务, 100K 请求 × 50 并发, WSL2 epoll**
@@ -61,7 +66,7 @@
 > Windows MT 高 **4.5×**（ASIO 靠多核堆 CPU — 110% / 69.6%）。
 > 内存经 detached 帧泄漏修复（P2-1）后与 ASIO 同级（5-12MB，修复前 3× 差距归零）。
 
-> 📖 详细文档 → [CodeReview 报告](doc/CodeReview.md) | [测试报告](doc/TestReport.md) | [API 手册](doc/ApiManual.md)
+> 📖 详细文档 → [架构设计](doc/ArchitectureDesign.md) | [CodeReview 报告](doc/CodeReview.md) | [测试报告](doc/TestReport.md) | [API 手册](doc/ApiManual.md)
 
 ---
 
